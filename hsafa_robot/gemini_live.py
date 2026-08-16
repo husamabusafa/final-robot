@@ -73,6 +73,20 @@ ToolHandler = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
  
 # How often to emit a one-line audio health summary (seconds).
 DIAG_INTERVAL = 3.0
+
+# Video gating (Gemini 3.1 turn coverage): the model's turn includes
+# ALL video frames sent during it, so a constant 1 FPS stream slows every
+# reply. We stream at full rate while the user is speaking (plus a tail
+# long enough to cover generation start) and while Gemini itself is
+# speaking (its turn is still open), and fall back to a heartbeat frame
+# every couple of seconds so the model always has fresh scene context.
+# The heartbeat matters: the server VAD triggers on speech as quiet as
+# -55 dBFS, which a client-side RMS gate would miss entirely -- without a
+# recent frame the model answers "what is this?" from stale/no images
+# and hallucinates.
+USER_SPEECH_RMS = 0.004   # linear RMS of a chunk that counts as speech
+USER_ACTIVE_TAIL_S = 5.0  # keep sending video this long after speech ends
+VIDEO_HEARTBEAT_S = 2.0   # one ambient frame this often while idle
  
  
 def _dbfs(value: float) -> float:
@@ -157,6 +171,14 @@ class GeminiLiveSession:
         # first speaker transient and permanently arm the barge-in window,
         # which is exactly what was stopping Gemini from firing
         # ``server_content.interrupted``.
+        #
+        # NOTE: the fixed threshold above is only a floor. Measured on the
+        # actual robot the speaker-bleed RMS while gated reaches -18..-25
+        # dBFS (0.06-0.12 linear) -- LOUDER than human speech at -25..-30
+        # dBFS -- so a hardcoded threshold false-fires barge-in on the
+        # robot's own voice and Gemini keeps interrupting itself (replies
+        # cut off after a word). We therefore track the live bleed level
+        # (``_bleed_rms``) and trip barge-in only above it with a margin.
         self._barge_in_rms = float(barge_in_rms)
         # Require this many CONSECUTIVE chunks above the RMS threshold
         # before arming the barge-in hold. Rejects brief transients that
@@ -177,6 +199,21 @@ class GeminiLiveSession:
         self._barge_in_until: float = 0.0
         # Counter of consecutive loud chunks (resets on any quiet chunk).
         self._barge_in_run: int = 0
+        # Rolling max of the RMS of GATED chunks (i.e. pure speaker bleed).
+        # Decays slowly so it follows volume changes. The effective
+        # barge-in threshold is max(_barge_in_rms, _bleed_rms * margin).
+        self._bleed_rms: float = 0.0
+        # Monotonic timestamp of the last audio chunk RECEIVED from Gemini.
+        # Used (a) to know whether gated mic audio can possibly be speaker
+        # bleed, and (b) by the is_speaking watchdog: 3.1 sometimes ends a
+        # turn without turn_complete/interrupted (user talks over
+        # generation), which would otherwise leave is_speaking stuck and
+        # the mic gated forever.
+        self._last_spk_audio_at: float = 0.0
+        # Monotonic timestamp. Video frames are only streamed while
+        # now < _user_active_until (plus a slow heartbeat) -- see the
+        # USER_SPEECH_RMS note above.
+        self._user_active_until: float = 0.0
  
         # Cross-thread state
         self.is_speaking = threading.Event()
@@ -331,6 +368,13 @@ class GeminiLiveSession:
             # talking. Default ``silence_duration_ms`` is ~500 ms;
             # halving it trims ~250 ms off end-of-speech latency at the
             # cost of a slightly higher chance of premature cut-offs.
+            # Gemini 3.1: thinking_level "minimal" is the lowest-latency
+            # setting (and the current default) -- set it explicitly so a
+            # future API default change can't silently add thinking delay.
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            # 1 FPS JPEGs don't need high-res tokens; low resolution cuts
+            # per-turn media processing time.
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     start_of_speech_sensitivity=(
@@ -471,17 +515,47 @@ class GeminiLiveSession:
                     chunk_rms = float(np.sqrt(np.mean(arr * arr)))
                 else:
                     chunk_rms = 0.0
-                if chunk_rms >= self._barge_in_rms:
-                    self._barge_in_run += 1
-                    if self._barge_in_run >= self._barge_in_min_chunks:
-                        self._barge_in_until = now + self._barge_in_hold_s
-                else:
-                    self._barge_in_run = 0
-                barge_in_active = now < self._barge_in_until
                 gating = (
                     self.is_speaking.is_set()
                     or now < self._mic_gate_until
                 )
+                barge_in_active = now < self._barge_in_until
+                # Watchdog: no audio from Gemini for >1.5 s while
+                # is_speaking is set => the server ended the turn without
+                # telling us (observed on 3.1). Clear the flag so the mic
+                # gate re-opens and the speaking animation stops.
+                if (
+                    self.is_speaking.is_set()
+                    and (now - self._last_spk_audio_at) > 1.5
+                ):
+                    log.info(
+                        "turn ended without turn_complete; clearing is_speaking"
+                    )
+                    self.is_speaking.clear()
+                    gating = now < self._mic_gate_until
+                if gating and not barge_in_active:
+                    # Gated chunks are only *speaker bleed* while audio
+                    # actually arrived from Gemini very recently. If
+                    # nothing is playing, loud audio here is a HUMAN --
+                    # feeding it into _bleed_rms would poison the
+                    # threshold and make barge-in unreachable.
+                    speaker_recent = (now - self._last_spk_audio_at) < 1.0
+                    if speaker_recent:
+                        if chunk_rms > self._bleed_rms:
+                            self._bleed_rms = chunk_rms
+                        else:
+                            self._bleed_rms *= 0.995  # ~3 s half-life @ 20 ms chunks
+                # Effective threshold: fixed floor, or 1.6x the live bleed
+                # level (~4 dB above the robot's own voice), whichever is
+                # higher. Real speech must exceed the echo to barge in.
+                thresh = max(self._barge_in_rms, self._bleed_rms * 1.6)
+                if chunk_rms >= thresh:
+                    self._barge_in_run += 1
+                    if self._barge_in_run >= self._barge_in_min_chunks:
+                        self._barge_in_until = now + self._barge_in_hold_s
+                        barge_in_active = True
+                else:
+                    self._barge_in_run = 0
                 if gating and not barge_in_active:
                     stats["gated"] += 1
                     if chunk_rms > stats["gated_rms"]:
@@ -490,6 +564,11 @@ class GeminiLiveSession:
                     continue
                 if barge_in_active and gating:
                     stats["barge_in"] += 1
+
+                # Mark user speech activity so the video task knows a
+                # conversation turn is in progress and keeps streaming.
+                if chunk_rms >= USER_SPEECH_RMS:
+                    self._user_active_until = now + USER_ACTIVE_TAIL_S
 
                 pcm16 = (arr * 32767.0).astype(np.int16)
  
@@ -527,7 +606,21 @@ class GeminiLiveSession:
     async def _video_task(self, session) -> None:
         if self._frame_source is None:
             return
+        last_heartbeat = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            user_active = (
+                now < self._user_active_until
+                # Gemini speaking == its turn is open; frames sent now are
+                # part of that turn's context (3.1 turn coverage).
+                or self.is_speaking.is_set()
+            )
+            heartbeat_due = (now - last_heartbeat) >= VIDEO_HEARTBEAT_S
+            if not user_active and not heartbeat_due:
+                await asyncio.sleep(0.2)
+                continue
+            if heartbeat_due:
+                last_heartbeat = now
             try:
                 jpeg = self._frame_source()
             except Exception as e:
@@ -640,6 +733,7 @@ class GeminiLiveSession:
                     data = msg.data
                     if data:
                         self.is_speaking.set()
+                        self._last_spk_audio_at = time.monotonic()
                         # Hold the mic gate while we're streaming audio out,
                         # plus a tail so the speaker buffer can drain and
                         # room echo can decay before we listen again.
