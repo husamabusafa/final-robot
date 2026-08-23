@@ -1,32 +1,5 @@
 [
   {
-    "id": "tatweer_site",
-    "company": "تطوير التعليم القابضة",
-    "title": "موقع شركة تطوير التعليم القابضة",
-    "type": "page",
-    "url": "https://www.tatweer.sa/ar",
-    "verified": true,
-    "keywords": ["تطوير", "القابضة", "tatweer", "holding", "الموقع", "الرئيسية"]
-  },
-  {
-    "id": "tatweer_speakup",
-    "company": "تطوير التعليم القابضة",
-    "title": "بوابة الإبلاغ عن المخالفات (SpeakUp)",
-    "type": "page",
-    "url": "https://speakup.tatweer.sa/",
-    "verified": true,
-    "keywords": ["تطوير", "الإبلاغ", "مخالفات", "speakup", "نزاهة"]
-  },
-  {
-    "id": "tatweer_channel",
-    "company": "تطوير التعليم القابضة",
-    "title": "قناة تطوير التعليم القابضة على يوتيوب",
-    "type": "page",
-    "url": "https://www.youtube.com/@tatweereducationholdingco.600",
-    "verified": true,
-    "keywords": ["تطوير", "القابضة", "قناة", "يوتيوب", "channel"]
-  },
-  {
     "id": "tatweer_doc_video",
     "company": "تطوير التعليم القابضة",
     "title": "فيديو وثائقي: تعرّف على شركات تطوير",
@@ -34,42 +7,6 @@
     "url": "https://www.youtube.com/watch?v=_QxekbFOym8",
     "verified": false,
     "keywords": ["تطوير", "القابضة", "فيديو", "وثائقي", "تعريفي", "المنظومة"]
-  },
-  {
-    "id": "tetco_site",
-    "company": "تيتكو",
-    "title": "موقع تيتكو (تطوير لتقنيات التعليم)",
-    "type": "page",
-    "url": "https://www.tetco.sa",
-    "verified": true,
-    "keywords": ["تيتكو", "tetco", "تقنيات التعليم", "الموقع", "الرئيسية"]
-  },
-  {
-    "id": "tetco_about",
-    "company": "تيتكو",
-    "title": "عن تيتكو",
-    "type": "page",
-    "url": "https://www.tetco.sa/ar/Pages/About.aspx",
-    "verified": true,
-    "keywords": ["تيتكو", "tetco", "من نحن", "عن الشركة"]
-  },
-  {
-    "id": "mosadaqa",
-    "company": "تيتكو",
-    "title": "بوابة مصادقة (المعادلات والشهادات)",
-    "type": "page",
-    "url": "https://www.mosadaqa.sa",
-    "verified": true,
-    "keywords": ["تيتكو", "مصادقة", "mosadaqa", "شهادات", "معادلة"]
-  },
-  {
-    "id": "tetco_channel",
-    "company": "تيتكو",
-    "title": "قناة تيتكو على يوتيوب",
-    "type": "page",
-    "url": "https://www.youtube.com/@tetco1494",
-    "verified": true,
-    "keywords": ["تيتكو", "tetco", "قناة", "يوتيوب", "channel"]
   },
   {
     "id": "tetco_future_video",
@@ -90,33 +27,6 @@
     "keywords": ["تيتكو", "tetco", "فيديو", "ميداني", "مدارس", "صيانة"]
   },
   {
-    "id": "talemia_site",
-    "company": "التعليمية",
-    "title": "موقع شركة التعليمية",
-    "type": "page",
-    "url": "https://www.talemia.sa",
-    "verified": true,
-    "keywords": ["التعليمية", "talemia", "الموقع", "الرئيسية"]
-  },
-  {
-    "id": "talemia_profdev",
-    "company": "التعليمية",
-    "title": "التطوير المهني في التعليمية",
-    "type": "page",
-    "url": "https://www.talemia.sa/Service/view/التطوير-المهني",
-    "verified": true,
-    "keywords": ["التعليمية", "talemia", "تطوير مهني", "تدريب", "خدمات"]
-  },
-  {
-    "id": "talemia_channel",
-    "company": "التعليمية",
-    "title": "قناة التعليمية على يوتيوب",
-    "type": "page",
-    "url": "https://www.youtube.com/@talemia_sa",
-    "verified": true,
-    "keywords": ["التعليمية", "talemia", "قناة", "يوتيوب", "channel"]
-  },
-  {
     "id": "talemia_intro_video",
     "company": "التعليمية",
     "title": "فيديو: التعريف بخدمات التعليمية",
@@ -135,42 +45,6 @@
     "keywords": ["التعليمية", "talemia", "فيديو", "رئيس تنفيذي", "مشاريع"]
   },
   {
-    "id": "tbc_site",
-    "company": "تطوير للمباني",
-    "title": "موقع شركة تطوير للمباني",
-    "type": "page",
-    "url": "https://tbc.sa/ar/",
-    "verified": true,
-    "keywords": ["تطوير للمباني", "tbc", "مباني", "الموقع", "الرئيسية"]
-  },
-  {
-    "id": "tbc_contact",
-    "company": "تطوير للمباني",
-    "title": "تواصل مع تطوير للمباني",
-    "type": "page",
-    "url": "https://tbc.sa/ar/Contactus",
-    "verified": true,
-    "keywords": ["تطوير للمباني", "tbc", "تواصل", "contact"]
-  },
-  {
-    "id": "tbc_policy",
-    "company": "تطوير للمباني",
-    "title": "سياسة الاستخدام - تطوير للمباني",
-    "type": "page",
-    "url": "https://tbc.sa/ar/policy",
-    "verified": true,
-    "keywords": ["تطوير للمباني", "tbc", "سياسة", "policy"]
-  },
-  {
-    "id": "tbc_channel",
-    "company": "تطوير للمباني",
-    "title": "قناة تطوير للمباني على يوتيوب",
-    "type": "page",
-    "url": "https://www.youtube.com/@tatweerbuildings",
-    "verified": true,
-    "keywords": ["تطوير للمباني", "tbc", "قناة", "يوتيوب", "channel"]
-  },
-  {
     "id": "tbc_intro_video",
     "company": "تطوير للمباني",
     "title": "فيديو: نبذة عن شركة تطوير للمباني",
@@ -178,24 +52,6 @@
     "url": "https://www.youtube.com/watch?v=L6B7JYDuSpI",
     "verified": false,
     "keywords": ["تطوير للمباني", "tbc", "فيديو", "نبذة", "تعريفي"]
-  },
-  {
-    "id": "rafed_site",
-    "company": "رافد",
-    "title": "موقع شركة رافد للنقل التعليمي",
-    "type": "page",
-    "url": "https://rafedsa.com",
-    "verified": true,
-    "keywords": ["رافد", "rafed", "نقل", "حافلات", "الموقع", "الرئيسية"]
-  },
-  {
-    "id": "rafed_channel",
-    "company": "رافد",
-    "title": "قناة رافد على يوتيوب",
-    "type": "page",
-    "url": "https://www.youtube.com/@Rafedsaudi",
-    "verified": true,
-    "keywords": ["رافد", "rafed", "قناة", "يوتيوب", "channel"]
   },
   {
     "id": "rafed_bus_video",

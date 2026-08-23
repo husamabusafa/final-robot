@@ -180,14 +180,21 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "\n"
     "SCREEN (a presentation page is open on the user's laptop and shows "
     "what you choose)\n"
-    "- \"show/play the X video\" or \"open the X page/site\": "
-    "`show_content(\"<what>\")` -- company videos and official pages "
-    "from the Tatweer group catalog.\n"
-    "- \"close/hide the screen\": `close_display()`.\n"
+    "- \"show/play the X video\": `show_content(\"<what>\")` -- company "
+    "videos from the Tatweer group catalog (videos only, no websites).\n"
+    "- \"show chart / show stats / show numbers\": call `show_chart` to "
+    "add a chart tile to the dashboard grid. Call it MULTIPLE times (at "
+    "least 3) to build a full dashboard -- one tile looks empty. For "
+    "example, when asked about a company, show 3-4 tiles: a stat_grid of "
+    "key numbers, a bar comparison, a pie breakdown, etc. chart_type can "
+    "be \"stat_grid\" (big numbers in a grid), \"bar\" (comparison), or "
+    "\"pie\" (breakdown). Pass labels[] and values[] of equal length.\n"
+    "- \"clear/hide the screen\": `clear_display()` -- clears all charts "
+    "and videos.\n"
     "- PROACTIVE: occasionally -- only when it genuinely fits the topic "
-    "and NOT in every reply -- offer to show something related, e.g. "
-    "\"تحب أعرض لك فيديو حملة حافلتي الصفراء؟\". Call show_content "
-    "only after the user agrees.\n"
+    "and NOT in every reply -- offer to show a chart or video, e.g. "
+    "\"تحب أعرض لك أرقام رافد؟\" or \"تحب أعرض فيديو حملة حافلتي "
+    "الصفراء؟\". Call the tool only after the user agrees.\n"
     "\n"
     "PRINCIPLE: prefer tools over guessing. Call the tool FIRST, then "
     "weave the result into a short Arabic reply.\n"
@@ -398,20 +405,44 @@ class AppState:
         self.gemini_connected = False
         self.gemini_speaking = False
         # Presentation screen state (what /display on the laptop shows).
-        self.display_url = ""
+        self.display_charts: list = []
         self.display_title = ""
-        self.display_type = ""
+        self.display_video_url = ""
+        self.display_video_title = ""
+        self.display_mode = ""  # "" | "chart" | "video"
 
-    def set_display(self, url: str, title: str = "", ctype: str = ""):
+    def add_chart(self, chart: dict):
         with self.lock:
-            self.display_url = url
-            self.display_title = title
-            self.display_type = ctype
+            self.display_mode = "chart"
+            self.display_video_url = ""
+            self.display_video_title = ""
+            self.display_charts.append(chart)
+
+    def clear_display(self):
+        with self.lock:
+            self.display_charts = []
+            self.display_title = ""
+            self.display_video_url = ""
+            self.display_video_title = ""
+            self.display_mode = ""
+
+    def set_video(self, url: str, title: str = ""):
+        with self.lock:
+            self.display_mode = "video"
+            self.display_video_url = url
+            self.display_video_title = title
+            self.display_charts = []
 
     def get_display(self) -> dict:
         with self.lock:
-            return {"url": self.display_url, "title": self.display_title,
-                    "type": self.display_type}
+            if self.display_mode == "video":
+                return {"type": "video", "url": self.display_video_url,
+                        "title": self.display_video_title}
+            elif self.display_mode == "chart":
+                return {"type": "chart", "title": self.display_title,
+                        "charts": self.display_charts}
+            else:
+                return {"type": "", "url": "", "title": "", "charts": []}
 
     def set_frame(self, jpeg: bytes, **kwargs):
         with self.lock:
@@ -433,106 +464,260 @@ state = AppState()
 # It polls /api/display and shows whatever the robot (Gemini tools) selects.
 DISPLAY_HTML = r"""<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>شاشة العرض</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
-html,body{margin:0;height:100%;background:#0b0f14}
-body{font-family:'Tajawal',system-ui,sans-serif}
-iframe{width:100%;height:100vh;border:0;display:block;background:#000}
-#empty{min-height:100vh;display:flex;flex-direction:column;align-items:center;
-justify-content:center;text-align:center;color:#e6edf3;padding:0 8vw;
-box-sizing:border-box}
-#empty h1{font-size:46px;font-weight:800;margin:0 0 10px;color:#ffffff}
-#empty .sub{font-size:22px;color:#9aa4b2;margin:8px 0;line-height:1.8;max-width:820px}
-#empty .comp{font-size:27px;font-weight:700;color:#5ea3f7;margin:22px 0 8px;
-letter-spacing:.5px}
-#empty .hint{font-size:19px;color:#6b7686;margin-top:26px}
-#ext{position:fixed;bottom:18px;left:18px;z-index:10;background:rgba(17,24,39,.9);
-color:#5ea3f7;font-size:16px;font-weight:700;padding:10px 18px;border-radius:10px;
-text-decoration:none;border:1px solid #1f2937}
+:root{
+  --bg:#0a0e1a;--bg2:#111827;--card:#151c2e;--card-h:#1a2338;
+  --border:#1e293b;--text:#e6edf3;--dim:#8b98a9;--accent:#5ea3f7;
+  --green:#22c55e;--red:#ef4444;--blue:#3b82f6;--purple:#a78bfa;
+  --orange:#f59e0b;--cyan:#06b6d4;--pink:#ec4899;--teal:#14b8a6;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);overflow:hidden}
+body{font-family:'Tajawal',system-ui,sans-serif;color:var(--text)}
+#dot{position:fixed;top:16px;left:16px;z-index:100;width:10px;height:10px;
+border-radius:50%;background:var(--red);opacity:.85;transition:background .3s}
+#idle{min-height:100vh;display:flex;flex-direction:column;align-items:center;
+justify-content:center;text-align:center;padding:0 8vw;transition:opacity .4s}
+#idle h1{font-size:48px;font-weight:900;margin:0 0 12px;
+background:linear-gradient(135deg,#5ea3f7,#a78bfa);-webkit-background-clip:text;
+-webkit-text-fill-color:transparent;background-clip:text}
+#idle .sub{font-size:23px;color:var(--dim);margin:8px 0;line-height:1.8;max-width:780px}
+#idle .comp{font-size:28px;font-weight:700;color:var(--accent);margin:24px 0 8px;letter-spacing:.5px}
+#idle .hint{font-size:19px;color:#5a6678;margin-top:28px}
+#idle .pulse{width:80px;height:80px;border-radius:50%;border:3px solid var(--accent);
+margin:0 0 30px;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:.4}50%{transform:scale(1.1);opacity:.8}}
+#dash{display:none;height:100vh;flex-direction:column}
+#dash-header{padding:18px 28px;background:linear-gradient(180deg,rgba(21,28,46,.95),rgba(10,14,26,.9));
+border-bottom:1px solid var(--border);backdrop-filter:blur(12px);flex-shrink:0}
+#dash-title{font-size:30px;font-weight:800;margin:0;color:var(--text);text-align:center}
+#dash-grid{flex:1;overflow-y:auto;padding:20px;display:grid;
+grid-template-columns:repeat(2,1fr);gap:16px;align-content:stretch;
+grid-auto-rows:1fr}
+@media(min-width:1400px){#dash-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:700px){#dash-grid{grid-template-columns:1fr}}
+.tile{background:var(--card);border:1px solid var(--border);border-radius:16px;
+padding:18px 20px;display:flex;flex-direction:column;animation:tileIn .4s ease-out;
+transition:border-color .3s,transform .2s}
+.tile:hover{border-color:var(--accent);transform:translateY(-2px)}
+@keyframes tileIn{from{opacity:0;transform:translateY(20px) scale(.96)}to{opacity:1;transform:none}}
+.tile-title{font-size:18px;font-weight:700;margin:0 0 14px;color:var(--accent);
+padding-bottom:10px;border-bottom:1px solid var(--border)}
+.tile-body{flex:1;position:relative;min-height:0}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;flex:1;align-content:center}
+@media(max-width:500px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+padding:18px 12px;text-align:center;transition:transform .2s,border-color .2s;
+display:flex;flex-direction:column;justify-content:center}
+.stat-card:hover{transform:scale(1.05);border-color:var(--accent)}
+.stat-value{font-size:32px;font-weight:900;line-height:1.1;margin-bottom:6px;
+background:linear-gradient(135deg,#5ea3f7,#a78bfa);-webkit-background-clip:text;
+-webkit-text-fill-color:transparent;background-clip:text}
+.stat-label{font-size:14px;color:var(--dim);font-weight:500}
+.tile canvas{max-height:none;flex:1}
+#video-frame{display:none;width:100%;height:100vh;border:0;background:#000}
 .hidden{display:none!important}
 </style></head>
 <body>
-<div id="empty">
+<div id="dot"></div>
+<div id="idle">
+  <div class="pulse"></div>
   <h1>أهلًا! أنا روبوتكم الذكي</h1>
   <p class="sub">اسألوني عن منظومة تطوير التعليم وشركاتها،
-  وأقدر أعرض لكم فيديوهاتها ومواقعها الرسمية على هذه الشاشة.</p>
+  وأقدر أعرض لكم الإحصائيات والرسوم البيانية والفيديوهات على هذه الشاشة.</p>
   <p class="comp">تيتكو &nbsp;•&nbsp; التعليمية &nbsp;•&nbsp; تطوير للمباني &nbsp;•&nbsp; رافد</p>
-  <p class="hint">جرّبوا تقولون لي: «اعرض فيديو حافلتي الصفراء» أو «افتح موقع تيتكو»</p>
+  <p class="hint">جرّبوا تقولون لي: «اعرض لي أرقام رافد» أو «قارن بين الشركات»</p>
 </div>
-<iframe id="fr" class="hidden"
+<div id="dash">
+  <div id="dash-header"><h2 id="dash-title">لوحة العرض</h2></div>
+  <div id="dash-grid"></div>
+</div>
+<iframe id="video-frame"
 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"
 allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
-<a id="ext" class="hidden" href="#" target="_blank" rel="noopener">افتح الصفحة في نافذة جديدة ↗</a>
 <script>
-let cur = "";
-const fr = document.getElementById("fr");
-const empty = document.getElementById("empty");
-const ext = document.getElementById("ext");
+let lastSerial = null;
+const idle = document.getElementById("idle");
+const dash = document.getElementById("dash");
+const dashGrid = document.getElementById("dash-grid");
+const dashTitle = document.getElementById("dash-title");
+const videoFrame = document.getElementById("video-frame");
+const dot = document.getElementById("dot");
+const COLORS = ["#5ea3f7","#a78bfa","#22c55e","#f59e0b","#ec4899","#06b6d4","#14b8a6","#ef4444"];
+function fmt(n){
+  if(n>=1e9) return (n/1e9).toFixed(1).replace(/\.0$/,"")+"B";
+  if(n>=1e6) return (n/1e6).toFixed(1).replace(/\.0$/,"")+"M";
+  if(n>=1e3) return (n/1e3).toFixed(1).replace(/\.0$/,"")+"K";
+  return String(Math.round(n));
+}
 function toEmbed(url){
   try{
     const u = new URL(url);
     let id = null;
     if(u.hostname.includes("youtu.be")) id = u.pathname.slice(1);
     else if(u.searchParams.get("v")) id = u.searchParams.get("v");
-    else {
-      const m = u.pathname.match(/\/(embed|shorts)\/([\w-]{11})/);
-      if(m) id = m[2];
-    }
+    else { const m = u.pathname.match(/\/(embed|shorts)\/([\w-]{11})/); if(m) id = m[2]; }
     if(!id) return url;
     const t = parseInt(u.searchParams.get("t")) || 0;
-    let src = "https://www.youtube-nocookie.com/embed/" + id +
-              "?autoplay=1&rel=0&enablejsapi=1";
+    let src = "https://www.youtube-nocookie.com/embed/" + id + "?autoplay=1&rel=0&enablejsapi=1";
     if(t) src += "&start=" + t;
     return src;
   }catch(e){ return url; }
 }
 function forcePlay(){
-  try{
-    fr.contentWindow.postMessage(
-      '{"event":"command","func":"playVideo","args":""}', "*");
-  }catch(e){}
+  try{ videoFrame.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}',"*"); }catch(e){}
 }
-let curType = "";
-// One-time unlock: after the first interaction with the page, browsers
-// allow autoplay with sound -- force-play whatever video is showing.
-window.addEventListener("pointerdown", function unlock(){
-  if(cur && curType === "video"){ forcePlay(); setTimeout(forcePlay, 800); }
-  window.removeEventListener("pointerdown", unlock);
-});
+function showVideo(url, title){
+  videoFrame.src = toEmbed(url);
+  videoFrame.style.display = "block";
+  idle.classList.add("hidden");
+  dash.classList.add("hidden");
+  dash.style.display = "none";
+  videoFrame.classList.remove("hidden");
+  document.title = title || "شاشة العرض";
+  setTimeout(forcePlay, 1500);
+  setTimeout(forcePlay, 3500);
+}
+function hideVideo(){
+  videoFrame.src = "about:blank";
+  videoFrame.style.display = "none";
+  videoFrame.classList.add("hidden");
+}
+function animateValue(el, target){
+  const dur = 1000, start = performance.now();
+  function tick(now){
+    const p = Math.min((now-start)/dur, 1);
+    const eased = 1 - Math.pow(1-p, 3);
+    el.textContent = fmt(target * eased);
+    if(p < 1) requestAnimationFrame(tick);
+    else el.textContent = fmt(target);
+  }
+  requestAnimationFrame(tick);
+}
+function renderStatGrid(container, chart){
+  const grid = document.createElement("div");
+  grid.className = "stat-grid";
+  chart.labels.forEach((label, i) => {
+    const val = chart.values[i] || 0;
+    const card = document.createElement("div");
+    card.className = "stat-card";
+    const vEl = document.createElement("div");
+    vEl.className = "stat-value";
+    const lEl = document.createElement("div");
+    lEl.className = "stat-label";
+    lEl.textContent = label;
+    card.appendChild(vEl);
+    card.appendChild(lEl);
+    grid.appendChild(card);
+    animateValue(vEl, val);
+  });
+  container.appendChild(grid);
+}
+function renderBarChart(container, chart){
+  const canvas = document.createElement("canvas");
+  container.appendChild(canvas);
+  new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: chart.labels,
+      datasets: [{
+        data: chart.values,
+        backgroundColor: chart.labels.map((_,i) => COLORS[i % COLORS.length] + "cc"),
+        borderColor: chart.labels.map((_,i) => COLORS[i % COLORS.length]),
+        borderWidth: 2, borderRadius: 8, minBarLength: 8,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => fmt(ctx.parsed.y) } } },
+      scales: {
+        x: { ticks: { color: "#8b98a9", font: { family: "Tajawal", size: 13 } },
+             grid: { display: false } },
+        y: { ticks: { color: "#8b98a9", callback: v => fmt(v) },
+             grid: { color: "#1e293b" } }
+      }
+    }
+  });
+}
+function renderPieChart(container, chart){
+  const canvas = document.createElement("canvas");
+  container.appendChild(canvas);
+  new Chart(canvas, {
+    type: "doughnut",
+    data: {
+      labels: chart.labels,
+      datasets: [{
+        data: chart.values,
+        backgroundColor: chart.labels.map((_,i) => COLORS[i % COLORS.length]),
+        borderColor: "#0a0e1a", borderWidth: 3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { position: "bottom",
+        labels: { color: "#e6edf3", font: { family: "Tajawal", size: 13 }, padding: 12 } } }
+    }
+  });
+}
+function renderDashboard(data){
+  hideVideo();
+  dashTitle.textContent = data.title || "لوحة العرض";
+  dashGrid.innerHTML = "";
+  const charts = data.charts || [];
+  charts.forEach((chart, idx) => {
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    tile.style.animationDelay = (idx * 0.1) + "s";
+    const tEl = document.createElement("h3");
+    tEl.className = "tile-title";
+    tEl.textContent = chart.title || "";
+    tile.appendChild(tEl);
+    const body = document.createElement("div");
+    body.className = "tile-body";
+    tile.appendChild(body);
+    dashGrid.appendChild(tile);
+    if(chart.chart_type === "stat_grid") renderStatGrid(body, chart);
+    else if(chart.chart_type === "bar") renderBarChart(body, chart);
+    else if(chart.chart_type === "pie") renderPieChart(body, chart);
+  });
+  idle.classList.add("hidden");
+  dash.style.display = "flex";
+  dash.classList.remove("hidden");
+  document.title = data.title || "شاشة العرض";
+}
+function showIdle(){
+  hideVideo();
+  dash.classList.add("hidden");
+  dash.style.display = "none";
+  idle.classList.remove("hidden");
+  document.title = "شاشة العرض";
+}
 async function poll(){
   try{
     const r = await fetch("/api/display", {cache: "no-store"});
     const d = await r.json();
-    if(d.url !== cur){
-      cur = d.url;
-      curType = d.type || "";
-      if(d.url){
-        fr.src = (d.type === "video") ? toEmbed(d.url) : d.url;
-        if(d.type === "video"){
-          setTimeout(forcePlay, 1500);
-          setTimeout(forcePlay, 3500);
-        }
-        fr.classList.remove("hidden");
-        empty.classList.add("hidden");
-        document.title = d.title || "شاشة العرض";
-        if(d.type === "page"){
-          ext.href = d.url;
-          ext.classList.remove("hidden");
-        } else {
-          ext.classList.add("hidden");
-        }
+    dot.style.background = "#22c55e";
+    const serial = JSON.stringify(d);
+    if(serial !== lastSerial){
+      lastSerial = serial;
+      if(d.type === "video" && d.url){
+        showVideo(d.url, d.title);
+      } else if(d.type === "chart" && d.charts && d.charts.length > 0){
+        renderDashboard(d);
       } else {
-        fr.src = "about:blank";
-        fr.classList.add("hidden");
-        empty.classList.remove("hidden");
-        ext.classList.add("hidden");
-        document.title = "شاشة العرض";
+        showIdle();
       }
     }
-  }catch(e){}
+  }catch(e){
+    dot.style.background = "#ef4444";
+  }
   setTimeout(poll, 800);
 }
 poll();
@@ -766,13 +951,11 @@ def build_test_tools() -> list:
                 genai_types.FunctionDeclaration(
                     name="show_content",
                     description=(
-                        "Show a company video or web page on the "
-                        "presentation screen (the /display page open on "
-                        "the user's laptop). Content comes from the "
-                        "Tatweer group URL catalog: videos (e.g. Rafed "
-                        "yellow-bus campaign, TBC intro, TETCO future) "
-                        "and official pages (tetco.sa, talemia.sa, "
-                        "tbc.sa, rafedsa.com, mosadaqa.sa...)."
+                        "Show a company video on the presentation screen. "
+                        "Searches the Tatweer group video catalog (videos "
+                        "only -- no websites). Use for requests like "
+                        "'play the Rafed yellow-bus video' or 'show the "
+                        "TETCO future video'."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -780,8 +963,8 @@ def build_test_tools() -> list:
                             "query": genai_types.Schema(
                                 type=genai_types.Type.STRING,
                                 description=(
-                                    "What to show, e.g. 'فيديو حافلتي "
-                                    "الصفراء' or 'موقع تيتكو'."
+                                    "What video to show, e.g. 'فيديو "
+                                    "حافلتي الصفراء' or 'فيديو تيتكو'."
                                 ),
                             ),
                         },
@@ -789,8 +972,45 @@ def build_test_tools() -> list:
                     ),
                 ),
                 genai_types.FunctionDeclaration(
-                    name="close_display",
-                    description="Clear the presentation screen back to idle.",
+                    name="show_chart",
+                    description=(
+                        "Add a chart tile to the dashboard grid on the "
+                        "presentation screen. Call multiple times to build "
+                        "a multi-chart dashboard. Each call adds one tile. "
+                        "Use stat_grid for company key numbers (big animated "
+                        "numbers in a grid), bar for comparing companies on "
+                        "one metric, pie for showing a breakdown. Labels "
+                        "and values must be the same length."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "title": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description="Chart heading in Arabic, e.g. 'أرقام رافد'.",
+                            ),
+                            "chart_type": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                enum=["stat_grid", "bar", "pie"],
+                                description="stat_grid = big numbers in a grid, bar = comparison chart, pie = breakdown donut",
+                            ),
+                            "labels": genai_types.Schema(
+                                type=genai_types.Type.ARRAY,
+                                items=genai_types.Schema(type=genai_types.Type.STRING),
+                                description="Labels for each item, same length as values.",
+                            ),
+                            "values": genai_types.Schema(
+                                type=genai_types.Type.ARRAY,
+                                items=genai_types.Schema(type=genai_types.Type.NUMBER),
+                                description="Numeric values, same length as labels.",
+                            ),
+                        },
+                        required=["title", "chart_type", "labels", "values"],
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="clear_display",
+                    description="Clear the presentation screen -- removes all charts and videos, returns to idle.",
                     parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
                 ),
             ],
@@ -1042,14 +1262,40 @@ def make_tool_handler(
             if not entry:
                 return {"ok": False, "reason": "not_found",
                         "available_titles": [e.get("title") for e in url_catalog]}
-            state.set_display(entry.get("url", ""), entry.get("title", ""),
-                              entry.get("type", "page"))
+            if entry.get("type") != "video":
+                return {"ok": False, "reason": "not_video",
+                        "note": "Only videos are supported. Use show_chart for company data."}
+            state.set_video(entry.get("url", ""), entry.get("title", ""))
             return {"ok": True, "title": entry.get("title"),
-                    "type": entry.get("type"),
-                    "note": "Now visible on the presentation screen."}
+                    "type": "video",
+                    "note": "Now playing on the presentation screen."}
 
-        if name == "close_display":
-            state.set_display("", "", "")
+        if name == "show_chart":
+            title = str(args.get("title", "")).strip() or "رسم بياني"
+            chart_type = str(args.get("chart_type", "stat_grid")).strip()
+            labels = args.get("labels", [])
+            values = args.get("values", [])
+            if not isinstance(labels, list) or not isinstance(values, list):
+                return {"ok": False, "error": "labels and values must be arrays"}
+            if len(labels) != len(values):
+                return {"ok": False, "error": "labels and values must be the same length"}
+            if len(labels) == 0:
+                return {"ok": False, "error": "labels and values cannot be empty"}
+            if chart_type not in ("stat_grid", "bar", "pie"):
+                return {"ok": False, "error": f"Unknown chart_type: {chart_type}"}
+            chart = {
+                "title": title,
+                "chart_type": chart_type,
+                "labels": [str(l) for l in labels],
+                "values": [float(v) for v in values],
+            }
+            state.add_chart(chart)
+            return {"ok": True, "title": title, "chart_type": chart_type,
+                    "items": len(labels),
+                    "note": "Chart added to the dashboard."}
+
+        if name == "clear_display":
+            state.clear_display()
             return {"ok": True}
 
         # --- Face tools ---

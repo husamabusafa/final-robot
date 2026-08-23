@@ -12,6 +12,10 @@ cd "$(dirname "$0")"
 pkill -f "display-chrome-profile" 2>/dev/null
 sleep 0.5
 
+# Kill anything on port 3000 (stale HTTP server from previous run)
+lsof -ti :3000 | xargs kill -9 2>/dev/null
+sleep 0.3
+
 # Launch Chrome in app mode pointing at display.html
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --user-data-dir=/tmp/display-chrome-profile \
