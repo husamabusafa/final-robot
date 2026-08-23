@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import type { Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -16,14 +16,20 @@ import type { Tile } from "../../shared/protocol.ts";
 const STYLE_URL = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 const DEFAULT_CENTER: [number, number] = [46.6753, 24.7136]; // Riyadh
 
-let rtlReady: Promise<unknown> | null = null;
-function ensureRtlPlugin(): Promise<unknown> {
-  if (!rtlReady) {
-    rtlReady = maplibregl
+let rtlStarted = false;
+function ensureRtlPlugin(): void {
+  // Best-effort and fire-and-forget: if the plugin fails, the map must still
+  // render (labels degrade, pins and basemap are unaffected). Gating map
+  // creation on this promise is how a plugin hiccup becomes a blank tile.
+  if (rtlStarted) return;
+  rtlStarted = true;
+  try {
+    void maplibregl
       .setRTLTextPlugin("/mapbox-gl-rtl-text.js", true)
-      .catch(() => {});
+      .catch((e) => console.warn("[map] RTL plugin failed:", e));
+  } catch (e) {
+    console.warn("[map] RTL plugin failed:", e);
   }
-  return rtlReady;
 }
 
 function markerElement(accent: string): HTMLElement {
@@ -36,22 +42,22 @@ function markerElement(accent: string): HTMLElement {
 export function MapTile({ tile }: { tile: Tile }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MlMap | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    let disposed = false;
+    const container = containerRef.current;
+    if (!container) return;
+    ensureRtlPlugin();
+
     let map: MlMap | null = null;
-
-    void ensureRtlPlugin().then(() => {
-      if (disposed || !containerRef.current) return;
-
+    try {
       const markers = tile.markers ?? [];
       const center: [number, number] =
         tile.center ??
         (markers[0] ? [markers[0].lng, markers[0].lat] : DEFAULT_CENTER);
 
       map = new maplibregl.Map({
-        container: containerRef.current,
+        container,
         style: STYLE_URL,
         center,
         zoom: tile.zoom ?? (markers.length > 1 ? 4 : 12),
@@ -84,10 +90,22 @@ export function MapTile({ tile }: { tile: Tile }) {
           map!.fitBounds(bounds, { padding: 70, duration: 1200, maxZoom: 12 });
         }
       });
-    });
+
+      map.on("error", (e) => {
+        console.warn("[map] error:", e?.error ?? e);
+        setError("تعذّر تحميل الخريطة");
+      });
+    } catch (e) {
+      console.warn("[map] init failed:", e);
+      setError("تعذّر تحميل الخريطة");
+    }
+
+    // The tile mounts mid-layout-animation, so the container can briefly
+    // report zero size; nudge a resize once the entrance settles.
+    const resizeTimer = window.setTimeout(() => map?.resize(), 500);
 
     return () => {
-      disposed = true;
+      window.clearTimeout(resizeTimer);
       map?.remove();
       mapRef.current = null;
     };
@@ -95,10 +113,18 @@ export function MapTile({ tile }: { tile: Tile }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  if (error) {
+    return (
+      <div className="flex h-full items-center justify-center text-dim">
+        {error}
+      </div>
+    );
+  }
+
   return (
     <div
       ref={containerRef}
-      className="h-full w-full overflow-hidden rounded-xl [&_.maplibregl-popup-content]:!bg-ink-2
+      className="h-full min-h-[200px] w-full overflow-hidden rounded-xl [&_.maplibregl-popup-content]:!bg-ink-2
                  [&_.maplibregl-popup-content]:!text-fg [&_.maplibregl-popup-content]:!font-sans
                  [&_.maplibregl-popup-content]:!text-sm [&_.maplibregl-popup-content]:!font-bold
                  [&_.maplibregl-popup-tip]:!border-t-ink-2"
