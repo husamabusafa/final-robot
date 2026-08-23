@@ -19,6 +19,8 @@ const SLOTS: Record<number, number[]> = {
 /** How much a tile benefits from extra width. */
 function widthAppetite(tile: Tile): number {
   switch (tile.type) {
+    case "map":
+      return 5;
     case "line":
       return 4;
     case "kpi":

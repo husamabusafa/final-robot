@@ -5,6 +5,7 @@ import { rowCount, spans } from "../layout.ts";
 import { BarTile } from "../tiles/BarTile.tsx";
 import { KpiTile } from "../tiles/KpiTile.tsx";
 import { LineTile } from "../tiles/LineTile.tsx";
+import { MapTile } from "../tiles/MapTile.tsx";
 import { PieTile } from "../tiles/PieTile.tsx";
 import { TableTile } from "../tiles/TableTile.tsx";
 import { TileFrame } from "../tiles/TileFrame.tsx";
@@ -21,6 +22,8 @@ function TileBody({ tile }: { tile: Tile }) {
       return <LineTile tile={tile} />;
     case "table":
       return <TableTile tile={tile} />;
+    case "map":
+      return <MapTile tile={tile} />;
   }
 }
 

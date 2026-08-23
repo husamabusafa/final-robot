@@ -12,8 +12,14 @@ export const PROTOCOL_VERSION = 1;
 /** Hard ceiling on tiles in a dashboard -- more than this and nothing is readable. */
 export const MAX_TILES = 6;
 
-export const TILE_TYPES = ["kpi", "bar", "pie", "line", "table"] as const;
+export const TILE_TYPES = ["kpi", "bar", "pie", "line", "table", "map"] as const;
 export type TileType = (typeof TILE_TYPES)[number];
+
+export interface MapMarker {
+  label: string;
+  lng: number;
+  lat: number;
+}
 
 export interface Tile {
   /** Stable identity so React never re-mounts (and re-animates) an existing tile. */
@@ -28,6 +34,12 @@ export interface Tile {
   textValues?: string[];
   /** Suffix shown after formatted numbers, e.g. "طالب", "%", "ريال". */
   unit?: string;
+  /** map only: map centre as [lng, lat]. */
+  center?: [number, number];
+  /** map only: initial zoom; ignored when markers are fitted instead. */
+  zoom?: number;
+  /** map only: pins to draw. */
+  markers?: MapMarker[];
 }
 
 export type DisplayMode = "idle" | "dashboard" | "video";
@@ -127,17 +139,43 @@ function parseTile(raw: unknown): Tile | null {
   const o = raw as Record<string, unknown>;
   const type = o.type as TileType;
   if (!TILE_TYPES.includes(type)) return null;
-  const labels = Array.isArray(o.labels) ? o.labels.map(String) : [];
-  if (labels.length === 0) return null;
-  const values = Array.isArray(o.values) ? o.values.map(Number).map((n) => (Number.isFinite(n) ? n : 0)) : [];
-  const textValues = Array.isArray(o.textValues) ? o.textValues.map(String) : undefined;
-  return {
+
+  const tile: Tile = {
     id: String(o.id ?? `t${Date.now()}${Math.random().toString(36).slice(2, 6)}`),
     type,
     title: String(o.title ?? ""),
-    labels,
-    values,
-    ...(textValues ? { textValues } : {}),
-    ...(o.unit ? { unit: String(o.unit) } : {}),
+    labels: Array.isArray(o.labels) ? o.labels.map(String) : [],
+    values: Array.isArray(o.values)
+      ? o.values.map(Number).map((n) => (Number.isFinite(n) ? n : 0))
+      : [],
   };
+  if (Array.isArray(o.textValues)) tile.textValues = o.textValues.map(String);
+  if (o.unit) tile.unit = String(o.unit);
+
+  if (type === "map") {
+    if (Array.isArray(o.markers)) {
+      tile.markers = (o.markers as unknown[])
+        .map(parseMarker)
+        .filter((m): m is MapMarker => m !== null);
+    }
+    const c = o.center;
+    if (Array.isArray(c) && c.length === 2 && c.every((n) => Number.isFinite(Number(n)))) {
+      tile.center = [Number(c[0]), Number(c[1])];
+    }
+    if (Number.isFinite(Number(o.zoom))) tile.zoom = Number(o.zoom);
+    // A map with neither pins nor a centre is a picture of the ocean.
+    if (!tile.markers?.length && !tile.center) return null;
+  } else if (tile.labels.length === 0) {
+    return null;
+  }
+  return tile;
+}
+
+function parseMarker(raw: unknown): MapMarker | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const lng = Number(o.lng);
+  const lat = Number(o.lat);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  return { label: String(o.label ?? ""), lng, lat };
 }

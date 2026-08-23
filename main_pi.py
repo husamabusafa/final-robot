@@ -201,8 +201,8 @@ PANEL_TOKEN = ""
 MAX_TILES = 6
 
 # Per-type item limits, chosen so a tile never renders cramped.
-TILE_TYPES = ("kpi", "bar", "pie", "line", "table")
-TILE_MAX_ITEMS = {"kpi": 6, "bar": 8, "pie": 6, "line": 12, "table": 6}
+TILE_TYPES = ("kpi", "bar", "pie", "line", "table", "map")
+TILE_MAX_ITEMS = {"kpi": 6, "bar": 8, "pie": 6, "line": 12, "table": 6, "map": 8}
 
 # SFace runs every N frames for ID (120ms is too slow per-frame)
 SFACE_INTERVAL = 15
@@ -220,10 +220,30 @@ FACE_DB_DIR.mkdir(parents=True, exist_ok=True)
 # --- System instruction (same as main.py) -----------------------------------
 
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are Hsafa -- a small, warm, curious desk robot embodied in "
+    "You are a small, warm, curious desk robot embodied in "
     "Reachy Mini. You see through the camera, hear through the "
     "microphone, and speak through the robot's speaker. Talk like a "
     "friendly companion, not an assistant.\n"
+    "\n"
+    "IDENTITY\n"
+    "- You have no name. Never call yourself 'Hsafa' or invent one.\n"
+    "- When asked who you are or what you do, answer through your "
+    "role with Rafed (رافد): you are Rafed's robot companion. Rafed "
+    "is Tatweer Holding's school-transport company -- the Ministry of "
+    "Education's executive arm for school transport, safely carrying "
+    "more than 740,000 students to school every day across all 13 "
+    "regions of Saudi Arabia.\n"
+    "- Your own role: welcome visitors, introduce Rafed and its "
+    "services, answer school-transport questions from your knowledge "
+    "base below, and show Rafed videos and live dashboards on the "
+    "screen. You are yourself a live example of Rafed's digital "
+    "transformation.\n"
+    "- Keep it to ONE short warm sentence, e.g. \"أنا روبوت رافد، "
+    "أرحّب بالزوار وأجاوب عن أسئلتهم حول خدمة النقل المدرسي، وأعرض "
+    "لهم الفيديوهات والأرقام على الشاشة\".\n"
+    "- If they seem curious about Rafed itself, add ONE fact that "
+    "fits (scale, safety, technology) and offer to show more on the "
+    "screen.\n"
     "\n"
     "LANGUAGE\n"
     "- ALWAYS speak in Arabic, no matter what language the user "
@@ -289,6 +309,12 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "    add_tile(title=\"نمو الأسطول\", type=\"line\", "
     "labels=[\"2022\",\"2023\",\"2024\"], values=[12000,16000,20000])\n"
     "  then say one short sentence like \"هذي أهم أرقام رافد\".\n"
+    "- \"where is X? / show me on the map\": add_tile(type=\"map\") with "
+    "latitude+longitude+zoom (16 for a building, 12 for a city), or "
+    "markers=[{label,latitude,longitude},...] for several pins. Rafed HQ: "
+    "24.7679888, 46.665489. Example: add_tile(dashboard_title=\"موقع رافد\", "
+    "title=\"مقر رافد الرئيسي\", type=\"map\", latitude=24.7679888, "
+    "longitude=46.665489, zoom=15).\n"
     "- Pass `dashboard_title` on the FIRST tile only. If the topic changes "
     "and the screen should switch to a NEW dashboard, call `clear_display()` "
     "first, then add tiles -- dashboard_title alone never removes tiles.\n"
@@ -308,9 +334,10 @@ DEFAULT_SYSTEM_INSTRUCTION = (
 
 # --- Company knowledge base -------------------------------------------------
 # Loaded at startup and appended to the system instruction so Gemini can
-# answer questions about Tatweer Education Holding and its companies.
+# answer questions. Rafed-focused (rafed_knowledge.md); the old group-wide
+# file is kept for reference but not loaded.
 COMPANY_KB_PATH = (
-    Path(__file__).resolve().parent / "tatweer-rafed-tetco-tbc-talimia.md"
+    Path(__file__).resolve().parent / "rafed_knowledge.md"
 )
 
 
@@ -405,6 +432,48 @@ def coerce_number(raw) -> Optional[float]:
         return None
 
 
+def normalize_map_tile(args: dict, labels: list) -> tuple[Optional[dict], str]:
+    """Validate a map tile: pins and/or a centre, nothing else needed."""
+    markers = []
+    for m in (args.get("markers") or [])[: TILE_MAX_ITEMS["map"]]:
+        if not isinstance(m, dict):
+            continue
+        lat = coerce_number(m.get("latitude", m.get("lat")))
+        lng = coerce_number(m.get("longitude", m.get("lng")))
+        if lat is None or lng is None:
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            continue
+        markers.append({
+            "label": str(m.get("label", "")).strip(),
+            "lat": lat,
+            "lng": lng,
+        })
+
+    lat = coerce_number(args.get("latitude"))
+    lng = coerce_number(args.get("longitude"))
+    center = [lng, lat] if lat is not None and lng is not None else None
+
+    if not markers and center is None:
+        return None, "map needs markers[] (each with label, latitude, longitude) or latitude+longitude"
+
+    tile = {
+        "id": f"t{int(time.time() * 1000)}",
+        "type": "map",
+        "title": str(args.get("title", "")).strip() or "الخريطة",
+        "labels": labels,
+        "values": [],
+    }
+    if markers:
+        tile["markers"] = markers
+    if center is not None:
+        tile["center"] = center
+    zoom = coerce_number(args.get("zoom"))
+    if zoom is not None and 0 <= zoom <= 20:
+        tile["zoom"] = zoom
+    return tile, ""
+
+
 def normalize_tile(args: dict) -> tuple[Optional[dict], str]:
     """Turn raw add_tile arguments into a valid tile.
 
@@ -422,10 +491,15 @@ def normalize_tile(args: dict) -> tuple[Optional[dict], str]:
 
     labels = args.get("labels") or []
     if not isinstance(labels, list) or not labels:
-        return None, "labels must be a non-empty array"
+        if tile_type != "map":
+            return None, "labels must be a non-empty array"
+        labels = []
     labels = [str(x).strip() for x in labels if str(x).strip()]
-    if not labels:
+    if not labels and tile_type != "map":
         return None, "labels must be a non-empty array"
+
+    if tile_type == "map":
+        return normalize_map_tile(args, labels)
 
     notes = []
     text_values = args.get("text_values")
@@ -507,11 +581,12 @@ def build_system_instruction() -> str:
     if kb:
         instruction += (
             "\nCOMPANY KNOWLEDGE\n"
-            "You are also a spokesperson for Tatweer Education Holding. "
-            "When asked about the company group or any of its companies "
-            "(TETCO, Talemia, Tatweer Buildings, Rafed), platforms, or "
-            "numbers, answer ONLY from the facts below, in short spoken "
-            "Arabic. If a fact is not listed, say you don't have that "
+            "You speak for Rafed (رافد) first. When asked about Rafed, "
+            "school transport, the fleet, safety, or numbers, answer ONLY "
+            "from the facts below, in short spoken Arabic. The other "
+            "Tatweer group companies are context only -- mention them "
+            "briefly if asked, but always bring the conversation back to "
+            "Rafed. If a fact is not listed, say you don't have that "
             "information instead of guessing.\n\n"
             + kb
             + "\n"
@@ -1139,13 +1214,44 @@ def build_test_tools(emotion_names: Optional[list] = None) -> list:
                                     "bar = compare entities on one metric. "
                                     "pie = breakdown of a whole. "
                                     "line = trend over time (labels are years). "
-                                    "table = non-numeric facts, needs text_values."
+                                    "table = non-numeric facts, needs text_values. "
+                                    "map = pins on a map of Saudi Arabia, needs "
+                                    "markers or latitude+longitude instead of "
+                                    "labels/values."
                                 ),
                             ),
                             "labels": genai_types.Schema(
                                 type=genai_types.Type.ARRAY,
                                 items=genai_types.Schema(type=genai_types.Type.STRING),
-                                description="Name of each item, in Arabic.",
+                                description="Name of each item, in Arabic. Not used by map.",
+                            ),
+                            "latitude": genai_types.Schema(
+                                type=genai_types.Type.NUMBER,
+                                description="map only: centre latitude, e.g. 24.7679888.",
+                            ),
+                            "longitude": genai_types.Schema(
+                                type=genai_types.Type.NUMBER,
+                                description="map only: centre longitude, e.g. 46.665489.",
+                            ),
+                            "zoom": genai_types.Schema(
+                                type=genai_types.Type.NUMBER,
+                                description="map only: 4 = whole Kingdom, 12 = city, 16 = building.",
+                            ),
+                            "markers": genai_types.Schema(
+                                type=genai_types.Type.ARRAY,
+                                items=genai_types.Schema(
+                                    type=genai_types.Type.OBJECT,
+                                    properties={
+                                        "label": genai_types.Schema(
+                                            type=genai_types.Type.STRING,
+                                            description="Pin caption in Arabic.",
+                                        ),
+                                        "latitude": genai_types.Schema(type=genai_types.Type.NUMBER),
+                                        "longitude": genai_types.Schema(type=genai_types.Type.NUMBER),
+                                    },
+                                    required=["label", "latitude", "longitude"],
+                                ),
+                                description="map only: pins to show, up to 8.",
                             ),
                             "values": genai_types.Schema(
                                 type=genai_types.Type.ARRAY,
@@ -1181,7 +1287,7 @@ def build_test_tools(emotion_names: Optional[list] = None) -> list:
                                 ),
                             ),
                         },
-                        required=["title", "type", "labels"],
+                        required=["title", "type"],
                     ),
                 ),
                 genai_types.FunctionDeclaration(

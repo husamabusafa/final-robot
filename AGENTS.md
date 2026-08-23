@@ -11,7 +11,8 @@ deployed presentation screen.
 | `hsafa_robot/` | Supporting modules (Gemini session, face DB, tracking, panel client) |
 | `panel/` | The presentation screen: Vite + React client and Fastify relay, one deployable image |
 | `scripts/simulate.py` | Drives the panel with a scripted dashboard, no robot needed |
-| `tatweer-rafed-tetco-tbc-talimia.md` | Company knowledge appended to the system instruction |
+| `rafed_knowledge.md` | Rafed-focused knowledge appended to the system instruction (verified warehouse numbers as of 2026-08-23 + official figures) |
+| `tatweer-rafed-tetco-tbc-talimia.md` | Old group-wide KB (TETCO/Talemia/TBC/Rafed) — kept for reference, **not loaded** |
 | `urls.json` | Video catalog searched by the `show_content` tool |
 
 ## Running the robot
@@ -114,8 +115,15 @@ unhealthy.
 ## Dashboard tiles
 
 Gemini builds dashboards by calling `add_tile` once per tile, 3-4 times in a row.
-Five types, all using the same `labels[]` + `values[]` shape: `kpi`, `bar`,
-`pie`, `line`, `table` (which uses `text_values[]`).
+Six types: `kpi`, `bar`, `pie`, `line`, `table` (uses `text_values[]`), and
+`map` (uses `latitude`/`longitude`/`zoom` or `markers[]`; MapLibre + CARTO dark
+basemap, RTL plugin self-hosted in `panel/public/`). The first five share the
+same `labels[]` + `values[]` shape.
+
+`dashboard_title` never removes tiles: a dashboard only begins when the screen
+is idle/showing a video/empty. Replacing content requires `clear_display` --
+Gemini passes `dashboard_title` unreliably, and a late one used to wipe the
+whole dashboard mid-build.
 
 `normalize_tile()` in `main_pi.py` repairs the model's arguments rather than
 rejecting them -- coercing `"740,000"` and `"1.2M"`, truncating mismatched
