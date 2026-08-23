@@ -186,6 +186,6 @@ Concrete examples cut tool-call errors far more than added rules do.
 
 ## Open
 
-- Panel subdomain.
+- Panel subdomain: **robot-pannel.hsafa.com**.
 - Public URL vs a light `?k=<key>` gate. Public is fine for a demo screen, but a
-  shared link becomes indexable.
+  shared link becomes indexable. Currently public, with `noindex` on the page.

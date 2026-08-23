@@ -17,9 +17,22 @@ import argparse
 import asyncio
 import json
 import os
+import ssl
 import sys
 
 import websockets
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - certifi ships with pip's deps
+    certifi = None
+
+
+def ws_kwargs(url: str) -> dict:
+    """macOS Pythons lack system root CAs; give wss:// an explicit bundle."""
+    if url.startswith("wss://") and certifi is not None:
+        return {"ssl": ssl.create_default_context(cafile=certifi.where())}
+    return {}
 
 DEFAULT_URL = os.environ.get("PANEL_URL", "ws://localhost:4001/robot")
 DEFAULT_TOKEN = os.environ.get("HSAFA_PANEL_TOKEN", "dev-token")
@@ -109,7 +122,7 @@ async def main() -> int:
     url = args.url + ("&" if "?" in args.url else "?") + f"token={args.token}"
     print(f"connecting to {args.url}")
     try:
-        async with websockets.connect(url) as ws:
+        async with websockets.connect(url, **ws_kwargs(args.url)) as ws:
             print("connected")
             while True:
                 await scenario(ws, args.delay)

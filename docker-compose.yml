@@ -9,7 +9,6 @@
 services:
   panel:
     build: ./panel
-    container_name: hsafa-panel
     restart: unless-stopped
     environment:
       # Coolify replaces this with the generated https:// URL.

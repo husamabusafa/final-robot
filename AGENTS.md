@@ -25,12 +25,33 @@ Env (`.env`, never committed):
 | Var | Purpose |
 |---|---|
 | `GEMINI_API_KEY` | Gemini Live |
-| `OPENROUTER_API_KEY` | `look_at` vision model |
-| `PANEL_URL` | e.g. `wss://panel.example.com/robot`. Unset = local screen only |
+| `PANEL_URL` | `wss://robot-pannel.hsafa.com/robot`. Unset = local screen only |
 | `HSAFA_PANEL_TOKEN` | Must match the panel deployment |
 
 Local camera/debug stream stays on `http://reachy-mini.local:8080/`, with a
 dependency-free fallback screen at `/display` for demos with no internet.
+
+### Getting code onto the Pi
+
+The Pi only runs robot code -- never `panel/` (Coolify builds that) and never
+the local `node_modules/` or `.venv/`. Sync with excludes:
+
+```bash
+rsync -av \
+  --exclude node_modules --exclude .venv --exclude .git \
+  --exclude panel/dist --exclude __pycache__ --exclude models \
+  /Users/Husam/Dev/final-robot/ \
+  pollen@reachy-mini.local:/home/pollen/final-robot/
+```
+
+On the Pi, install only non-SDK extras -- see the Animation section about why
+`pip install -r requirements_pi.txt` is not allowed to manage `reachy-mini`:
+
+```bash
+pip install google-genai python-dotenv websockets silero-vad \
+            opencv-contrib-python numpy scipy croniter
+python main_pi.py
+```
 
 ## Panel
 
@@ -71,12 +92,22 @@ replays every count-up animation, which is what the old polling screen did.
 
 ### Deploying to Coolify
 
-1. New resource → Docker Compose → this repo, file `docker-compose.yml`.
-2. Set `HSAFA_PANEL_TOKEN` in the resource's environment.
-3. Coolify fills `SERVICE_FQDN_PANEL_3000` and terminates TLS; WebSocket
-   upgrades on `/panel` and `/robot` need no extra config.
-4. Put `PANEL_URL=wss://<that domain>/robot` and the same token in the robot's
-   `.env`.
+Deployed at **https://robot-pannel.hsafa.com**.
+
+1. Create New Resource → **Public Repository** (the git-based option, *not* the
+   "Docker Compose" tile, which only takes pasted YAML and has no repo to build
+   `./panel` from) → `https://github.com/husamabusafa/final-robot`.
+2. Change the build pack from Nixpacks to **Docker Compose**. Branch `main`,
+   Base Directory `/`, Docker Compose Location `/docker-compose.yml`.
+3. Set the domain to `https://robot-pannel.hsafa.com` and add
+   `HSAFA_PANEL_TOKEN` (runtime, not build) matching the robot's `.env`.
+4. Deploy, then check `https://robot-pannel.hsafa.com/healthz`.
+
+Never add a `networks:` section to `docker-compose.yml`: Coolify creates its own
+network and Traefik only joins that one, so a custom network makes routing pick
+the wrong container IP intermittently and requests hang with 504s. The
+`healthcheck` matters too -- Traefik won't route to a container it thinks is
+unhealthy.
 
 `?screen=1` on the panel URL hides the cursor for the presentation laptop.
 
@@ -95,6 +126,32 @@ that property when editing the tool handler.
 `MAX_TILES` is mirrored in `main_pi.py` and `panel/shared/protocol.ts`; change
 both.
 
+## Animation
+
+All animation is SDK-native. Do not reintroduce hand-rolled head sway.
+
+- **Speaking**: `mini.enable_wobbling()`. The SDK analyses speaker output and
+  composes 6-DOF head offsets *daemon-side, before IK*, so it layers on top of
+  daemon head tracking instead of fighting it. Amplitude follows loudness.
+- **Expressions**: `EmotionPlayer` + the `play_emotion` tool, backed by
+  `pollen-robotics/reachy-mini-emotions-library` (81 clips, sidecar audio).
+  Playback drives head/antennas/body at 100 Hz, so it *owns* the robot: head
+  tracking is paused and the antenna breathe is muted via `is_playing`.
+  `EMOTION_CHOICES` is a curated conversational subset, intersected at runtime
+  with what the library actually contains.
+- **Antennas**: `AntennaBreather`, idle breathe only. The one hand-rolled piece,
+  because the SDK has no antenna speech animation.
+
+Requires **reachy-mini >= 1.8.0 on the daemon**, not just in `apps_venv` —
+wobbling is a daemon-side feature. An older daemon ignores the command.
+
+The SDK version in `/venvs/apps_venv` must match the daemon, and both are owned
+by the robot's own updater. `reachy-mini` is therefore range-pinned, not exact,
+in both requirements files. Do not `pip install -r requirements_pi.txt` on the Pi
+to manage the SDK — it will downgrade `apps_venv` out of sync with the daemon.
+Install only the non-SDK extras there.
+
 ## Known issues
 
-- `.venv/` is committed to git. It should be removed from tracking and ignored.
+- Committed `.venv` blobs remain in git history. Untracked as of the
+  `.gitignore` cleanup, but history was not rewritten.
