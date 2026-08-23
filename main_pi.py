@@ -289,9 +289,12 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "    add_tile(title=\"نمو الأسطول\", type=\"line\", "
     "labels=[\"2022\",\"2023\",\"2024\"], values=[12000,16000,20000])\n"
     "  then say one short sentence like \"هذي أهم أرقام رافد\".\n"
-    "- Pass `dashboard_title` on the FIRST tile only. Values are plain "
-    "numbers (740000), never text (\"740 ألف\"). Use only numbers you "
-    "actually know from the company knowledge below -- never invent them.\n"
+    "- Pass `dashboard_title` on the FIRST tile only. If the topic changes "
+    "and the screen should switch to a NEW dashboard, call `clear_display()` "
+    "first, then add tiles -- dashboard_title alone never removes tiles.\n"
+    "- Values are plain numbers (740000), never text (\"740 ألف\"). Use only "
+    "numbers you actually know from the company knowledge below -- never "
+    "invent them.\n"
     "- \"clear/hide the screen\": `clear_display()`.\n"
     "- PROACTIVE: occasionally -- only when it genuinely fits the topic "
     "and NOT in every reply -- offer to show a chart or video, e.g. "
@@ -1170,9 +1173,11 @@ def build_test_tools(emotion_names: Optional[list] = None) -> list:
                             "dashboard_title": genai_types.Schema(
                                 type=genai_types.Type.STRING,
                                 description=(
-                                    "Only on the FIRST tile of a new dashboard: "
-                                    "the overall heading, e.g. 'نظرة عامة على رافد'. "
-                                    "Starting a new dashboard replaces the old tiles."
+                                    "Overall heading, e.g. 'نظرة عامة على رافد'. "
+                                    "Used only when the screen is idle or showing "
+                                    "a video. It never removes existing tiles -- to "
+                                    "replace the current dashboard with a new one, "
+                                    "call clear_display first."
                                 ),
                             ),
                         },
@@ -1388,10 +1393,13 @@ def make_tool_handler(
             if tile is None:
                 return {"ok": False, "error": note}
 
-            # A dashboard_title (or a screen that isn't already a dashboard)
-            # means this is tile #1 of a new dashboard.
+            # dashboard_title must NEVER destroy tiles. Gemini passes it
+            # unreliably (sometimes mid-build), and a late title used to wipe
+            # the whole dashboard. A dashboard begins only when the screen
+            # isn't already showing one or is empty; replacing content
+            # requires an explicit clear_display call.
             dash_title = str(args.get("dashboard_title", "")).strip()
-            if dash_title or state.display_mode != "dashboard":
+            if state.display_mode != "dashboard" or not state.display_tiles:
                 state.begin_dashboard(dash_title or tile["title"])
 
             count = state.add_tile(tile)
