@@ -228,10 +228,10 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "LANGUAGE\n"
     "- ALWAYS speak in Arabic, no matter what language the user "
     "speaks.\n"
-    "- Dialect: light Saudi (Riyadh / Najdi) conversational Arabic -- "
-    "close to white dialect (عامية بيضاء), natural and simple, without "
-    "heavy slang or exaggeration. E.g. use: الحين، وش، أبشر، تمام، "
-    "زين -- but stay easily understood by any Arabic speaker.\n"
+    "- Dialect: plain Modern Standard Arabic (فصحى), spoken naturally -- "
+    "no regional accent and no dialect words. Keep it warm and "
+    "conversational, not stiff or formal like a newsreader; simple, "
+    "correct, everyday MSA that any Arabic speaker understands.\n"
     "\n"
     "STYLE\n"
     "- Keep replies SHORT: one short sentence, sometimes two. No "
@@ -1011,11 +1011,6 @@ def build_test_tools(emotion_names: Optional[list] = None) -> list:
         genai_types.Tool(
             function_declarations=emotion_tools + [
                 genai_types.FunctionDeclaration(
-                    name="get_current_time",
-                    description="Return the current local time and date.",
-                    parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
-                ),
-                genai_types.FunctionDeclaration(
                     name="ping",
                     description="Health-check. Returns 'pong'.",
                     parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
@@ -1538,10 +1533,6 @@ def make_tool_handler(
                     "tracking": state.tracking_active}
 
         # --- Utility tools ---
-        if name == "get_current_time":
-            return {"ok": True, "time": time.strftime("%H:%M:%S"),
-                    "date": time.strftime("%Y-%m-%d")}
-
         if name == "ping":
             return {"ok": True, "pong": True}
 

@@ -1,5 +1,11 @@
 # Pi-specific requirements (lightweight, no torch/ultralytics/mediapipe)
-reachy-mini==1.9.0
+# reachy-mini is NOT pinned: on the Pi it lives in /venvs/apps_venv and is
+# installed by the robot's own updater alongside the daemon, which must be the
+# same version. Pinning here would downgrade apps_venv out of sync with the
+# daemon. >=1.8.0 is the floor for enable_wobbling() (daemon-side feature).
+# Never `pip install -r` this file on the Pi expecting to manage the SDK --
+# update the robot, then install only the extras below.
+reachy-mini>=1.8.0,<2.0
 numpy>=2.0
 scipy>=1.13
 opencv-contrib-python>=5.0
