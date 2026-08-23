@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* Self-hosted so venue wifi can't break the Arabic type mid-demo. */
+@import "@fontsource/tajawal/400.css";
+@import "@fontsource/tajawal/500.css";
+@import "@fontsource/tajawal/700.css";
+@import "@fontsource/tajawal/800.css";
+@import "@fontsource/tajawal/900.css";
+
+@theme {
+  --font-sans: "Tajawal", system-ui, sans-serif;
+
+  --color-ink: #070b16;
+  --color-ink-2: #0d1424;
+  --color-card: #131c30;
+  --color-line: #1e293b;
+  --color-fg: #e8eef6;
+  --color-dim: #8b98a9;
+
+  --color-c1: #5ea3f7;
+  --color-c2: #a78bfa;
+  --color-c3: #22c55e;
+  --color-c4: #f59e0b;
+  --color-c5: #ec4899;
+  --color-c6: #06b6d4;
+  --color-c7: #14b8a6;
+  --color-c8: #ef4444;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--color-ink);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  /* Ambient depth so large flat panels don't look like a slide deck. */
+  background-image:
+    radial-gradient(120% 80% at 15% 0%, rgba(94, 163, 247, 0.14), transparent 60%),
+    radial-gradient(100% 70% at 90% 100%, rgba(167, 139, 250, 0.12), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* Kiosk mode: ?screen=1 hides the cursor for the presentation laptop. */
+body[data-kiosk="1"] {
+  cursor: none;
+}
+
+/* Tabular figures keep count-up animations from shifting layout. */
+.numerals {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+.gradient-text {
+  background: linear-gradient(135deg, var(--color-c1), var(--color-c2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}

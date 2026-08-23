@@ -1,8 +1,8 @@
 # Pi-specific requirements (lightweight, no torch/ultralytics/mediapipe)
-reachy-mini==1.6.3
+reachy-mini==1.9.0
 numpy>=2.0
 scipy>=1.13
 opencv-contrib-python>=5.0
 google-genai>=1.70
 python-dotenv>=1.0
-openai>=1.0
+websockets>=15.0

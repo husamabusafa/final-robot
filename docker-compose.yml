@@ -1,0 +1,27 @@
+# Presentation panel: serves the screen and relays the robot's events.
+#
+# Coolify: point a Docker Compose resource at this file. SERVICE_FQDN_PANEL_3000
+# makes Coolify allocate the domain and route TLS + WebSocket upgrades to it, so
+# no reverse-proxy config is needed here.
+#
+# Locally, prefer `cd panel && npm run dev` -- it gives HMR. This file is for
+# verifying the production image.
+services:
+  panel:
+    build: ./panel
+    container_name: hsafa-panel
+    restart: unless-stopped
+    environment:
+      # Coolify replaces this with the generated https:// URL.
+      - SERVICE_FQDN_PANEL_3000
+      # Shared with the robot's .env; the /robot endpoint rejects anything else.
+      - HSAFA_PANEL_TOKEN=${HSAFA_PANEL_TOKEN:?set HSAFA_PANEL_TOKEN}
+      - PORT=3000
+      - LOG_LEVEL=info
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

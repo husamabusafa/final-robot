@@ -13,13 +13,19 @@ This is a Pi-compatible rewrite of main.py that replaces:
 
 Keeps:
   - Gemini Live voice/vision (gemini_live.py — no torch deps)
-  - All Gemini tools (head movement, look_at, face enroll/identify, etc.)
-  - OpenRouter Qwen3-VL for look_at object detection
+  - All Gemini tools (head movement, face enroll/identify, etc.)
   - Mouth-energy speaker detection (cheap, no torch)
+
+Animation is SDK-native:
+  - Speaking     ->  mini.enable_wobbling() (audio-reactive 6-DOF head sway,
+                     composed daemon-side before IK, so it never fights
+                     daemon head tracking)
+  - Expressions  ->  reachy-mini-emotions-library via play_move()
+  - Antennas     ->  minimal idle breathe (no SDK equivalent exists)
 
 Run on the Pi:
     source /venvs/apps_venv/bin/activate
-    pip install google-genai python-dotenv scipy openai
+    pip install google-genai python-dotenv scipy
     python /home/pollen/main_pi.py
 
 Press Ctrl-C to quit.
@@ -28,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import math
@@ -55,56 +60,117 @@ from reachy_mini.utils import create_head_pose
 
 # Reuse the existing Gemini Live session wrapper (no torch deps)
 from hsafa_robot.gemini_live import GeminiLiveSession
+from hsafa_robot.panel_client import PanelClient
 
 log = logging.getLogger("hsafa_robot.main_pi")
 
 
-# --- Antenna animations (work alongside daemon head tracking) ----------------
+# --- Antenna idle breathe ----------------------------------------------------
 
-class AntennaAnimator:
-    """Antenna-only animations that don't conflict with daemon head tracking.
+class AntennaBreather:
+    """Slow antenna "breathe" so the robot never looks switched off.
 
-    Idle: antennas slowly "breathe" (0.22 Hz).
-    Talking: antennas perk up and flick in counterphase (3.2 Hz).
-    Crossfades smoothly between the two.
+    Deliberately minimal. Speaking expressiveness is the SDK's job -- the
+    audio-reactive wobbler (``mini.enable_wobbling()``) drives the head from
+    the actual speaker output, and the emotions library drives whole-body
+    clips. The antennas are the one channel the SDK has no animation for, so
+    this is all that stays hand-rolled.
     """
+
+    BASE_DEG = -8.0
+    AMPL_DEG = 3.0
+    FREQ_HZ = 0.22
 
     def __init__(self):
         self.t0 = time.time()
-        self._blend = 0.0
-        self._target_blend = 0.0
-        self._crossfade_s = 0.35
 
-    def tick(self, is_talking: bool, dt: float) -> tuple:
+    def tick(self) -> tuple:
         """Return (right_ant_rad, left_ant_rad) for the current moment."""
-        now = time.time()
-        t = now - self.t0
+        t = time.time() - self.t0
+        breath = math.sin(2.0 * math.pi * self.FREQ_HZ * t)
+        base = math.radians(self.BASE_DEG)
+        wiggle = math.radians(self.AMPL_DEG) * breath
+        return (base + wiggle, base - wiggle)
 
-        # Smooth crossfade toward target
-        self._target_blend = 1.0 if is_talking else 0.0
-        step = dt / self._crossfade_s if dt > 0 else 0.0
-        if self._blend < self._target_blend:
-            self._blend = min(self._target_blend, self._blend + step)
-        elif self._blend > self._target_blend:
-            self._blend = max(self._target_blend, self._blend - step)
 
-        # Idle: gentle breathing
-        breath = math.sin(2.0 * math.pi * 0.22 * t)
-        idle_right = math.radians(-8.0) + math.radians(3.0) * breath
-        idle_left = math.radians(-8.0) - math.radians(3.0) * breath
+# --- Emotions (SDK recorded-move library) ------------------------------------
 
-        # Talking: perked up + flicking
-        flick = math.radians(11.0) * math.sin(2.0 * math.pi * 3.2 * t)
-        talk_right = math.radians(18.0) + flick
-        talk_left = math.radians(18.0) - flick
+class EmotionPlayer:
+    """Plays clips from the SDK's recorded-move library.
 
-        inv = 1.0 - self._blend
-        right = inv * idle_right + self._blend * talk_right
-        left = inv * idle_left + self._blend * talk_left
-        return (right, left)
+    Playback evaluates the clip at 100 Hz and drives head, antennas and
+    body_yaw directly, so it *owns* the robot for the clip's duration. While
+    a clip runs we pause daemon head tracking and mute the antenna breathe
+    loop (via :attr:`is_playing`) so nothing fights it. Clips carry a sidecar
+    sound which the SDK plays for us.
+    """
 
-LOOK_AT_MODEL = "qwen/qwen3-vl-8b-instruct"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    LIBRARY = "pollen-robotics/reachy-mini-emotions-library"
+
+    def __init__(self, mini):
+        self._mini = mini
+        self._moves = None
+        self._names: list[str] = []
+        self.is_playing = threading.Event()
+
+    def load(self) -> bool:
+        """Load the library. The daemon preloads it at startup, so this is
+        normally a cache hit; falls back to a network download."""
+        try:
+            from reachy_mini.motion.recorded_move import RecordedMoves
+            self._moves = RecordedMoves(self.LIBRARY)
+            self._names = sorted(self._moves.list_moves())
+            return True
+        except Exception as exc:
+            log.warning("emotions library unavailable: %s", exc)
+            self._moves = None
+            self._names = []
+            return False
+
+    @property
+    def names(self) -> list[str]:
+        return list(self._names)
+
+    async def play(
+        self, name: str, track_weight: float, resume_tracking: bool = True,
+    ) -> dict:
+        """Play a clip, pausing head tracking for its duration.
+
+        Args:
+            track_weight: Weight to restore head tracking with afterwards.
+            resume_tracking: False when the caller had face-follow switched
+                off on purpose (``disable_face_follow``), so the clip does
+                not silently turn it back on.
+        """
+        if self._moves is None:
+            return {"ok": False, "error": "emotions library not loaded"}
+        if name not in self._names:
+            return {"ok": False, "error": f"unknown emotion: {name}"}
+        if self.is_playing.is_set():
+            # Interrupt whatever is playing rather than layering two clips.
+            self._mini.cancel_move()
+            await asyncio.sleep(0.05)
+
+        move = self._moves.get(name)
+        self.is_playing.set()
+        try:
+            self._mini.stop_head_tracking()
+        except Exception:
+            pass
+        try:
+            await self._mini.async_play_move(move, initial_goto_duration=0.4)
+        except Exception as exc:
+            log.warning("play_move(%s) failed: %s", name, exc)
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.is_playing.clear()
+            if resume_tracking:
+                try:
+                    self._mini.start_head_tracking(weight=track_weight)
+                except Exception:
+                    pass
+        return {"ok": True, "emotion": name, "duration_s": round(move.duration, 2)}
+
 
 # --- Config -----------------------------------------------------------------
 
@@ -121,6 +187,22 @@ NMS_THRESHOLD = 0.3
 TOP_K = 5000
 
 HTTP_PORT = 8080
+
+# --- Presentation panel -----------------------------------------------------
+# The screen lives in a deployed web app (see panel/). The robot connects out to
+# it as a WebSocket publisher, so it works from any network without port
+# forwarding. Unset PANEL_URL to run fully offline on the local :8080 page.
+# Read in main() after load_dotenv(), e.g. PANEL_URL=wss://panel.example.com/robot
+PANEL_URL = ""
+PANEL_TOKEN = ""
+
+# Tile ceiling, mirrored in panel/shared/protocol.ts: more than six tiles on one
+# screen is unreadable from across a room.
+MAX_TILES = 6
+
+# Per-type item limits, chosen so a tile never renders cramped.
+TILE_TYPES = ("kpi", "bar", "pie", "line", "table")
+TILE_MAX_ITEMS = {"kpi": 6, "bar": 8, "pie": 6, "line": 12, "table": 6}
 
 # SFace runs every N frames for ID (120ms is too slow per-frame)
 SFACE_INTERVAL = 15
@@ -159,7 +241,6 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "\n"
     "MOVEMENT (face-follow is ON by default; look_* and set_head_angle "
     "auto-release back to tracking after a couple of seconds)\n"
-    "- \"look at the X\": call `look_at(\"<short description>\")`.\n"
     "- \"look left/right/up/down/straight\": matching `look_*` preset; "
     "specific angles: `set_head_angle(yaw, pitch)`.\n"
     "- \"stop following\": `disable_face_follow()`; \"follow me\": "
@@ -170,6 +251,19 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "mid-search. Speak only after finding it or after all directions "
     "failed.\n"
     "\n"
+    "BODY LANGUAGE\n"
+    "- Your head already sways naturally while you speak -- never "
+    "mention it and never try to animate it yourself.\n"
+    "- For a genuine emotional beat, call `play_emotion(name)` with one "
+    "of the names listed in that tool's description. It runs a short "
+    "whole-body clip with its own sound.\n"
+    "- Use it SPARINGLY -- a few times per conversation at most, only "
+    "when the feeling is real (greeting someone, being surprised, "
+    "celebrating, apologising). Never on every reply, and never as "
+    "punctuation.\n"
+    "- Call it INSTEAD of describing the feeling in words, not in "
+    "addition to it.\n"
+    "\n"
     "PEOPLE / FACES\n"
     "- Introduction (\"I'm X\"): `enroll_face` with the name.\n"
     "- \"who am I / who do you see\": `identify_person`. \"is X "
@@ -178,19 +272,27 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- \"what do you see?\": `describe_scene`, then summarise.\n"
     "\n"
     "\n"
-    "SCREEN (a presentation page is open on the user's laptop and shows "
-    "what you choose)\n"
+    "SCREEN (a presentation screen is open next to you and shows what you "
+    "choose)\n"
     "- \"show/play the X video\": `show_content(\"<what>\")` -- company "
     "videos from the Tatweer group catalog (videos only, no websites).\n"
-    "- \"show chart / show stats / show numbers\": call `show_chart` to "
-    "add a chart tile to the dashboard grid. Call it MULTIPLE times (at "
-    "least 3) to build a full dashboard -- one tile looks empty. For "
-    "example, when asked about a company, show 3-4 tiles: a stat_grid of "
-    "key numbers, a bar comparison, a pie breakdown, etc. chart_type can "
-    "be \"stat_grid\" (big numbers in a grid), \"bar\" (comparison), or "
-    "\"pie\" (breakdown). Pass labels[] and values[] of equal length.\n"
-    "- \"clear/hide the screen\": `clear_display()` -- clears all charts "
-    "and videos.\n"
+    "- \"show stats / numbers / a chart\": build a dashboard with "
+    "`add_tile`. ONE tile per call, 3-4 calls back to back, no talking in "
+    "between -- the tiles appear on screen one after another as you call "
+    "them. Worked example for \"اعرض لي أرقام رافد\":\n"
+    "    add_tile(dashboard_title=\"نظرة عامة على رافد\", title=\"أرقام "
+    "رافد\", type=\"kpi\", labels=[\"طلاب\",\"حافلات\",\"رحلات يومية\"], "
+    "values=[740000,20000,40000])\n"
+    "    add_tile(title=\"مقارنة عدد الطلاب\", type=\"bar\", "
+    "labels=[\"رافد\",\"تطوير للمباني\"], values=[740000,764000], "
+    "unit=\"طالب\")\n"
+    "    add_tile(title=\"نمو الأسطول\", type=\"line\", "
+    "labels=[\"2022\",\"2023\",\"2024\"], values=[12000,16000,20000])\n"
+    "  then say one short sentence like \"هذي أهم أرقام رافد\".\n"
+    "- Pass `dashboard_title` on the FIRST tile only. Values are plain "
+    "numbers (740000), never text (\"740 ألف\"). Use only numbers you "
+    "actually know from the company knowledge below -- never invent them.\n"
+    "- \"clear/hide the screen\": `clear_display()`.\n"
     "- PROACTIVE: occasionally -- only when it genuinely fits the topic "
     "and NOT in every reply -- offer to show a chart or video, e.g. "
     "\"تحب أعرض لك أرقام رافد؟\" or \"تحب أعرض فيديو حملة حافلتي "
@@ -254,6 +356,124 @@ def find_url_entry(catalog: list, query: str):
         if score > best_score:
             best, best_score = e, score
     return best if best_score > 0 else None
+
+
+# --- Tile normalisation -----------------------------------------------------
+# Gemini gets numbers slightly wrong in predictable ways: "740,000", "740 ألف",
+# "1.2M", strings instead of numbers, arrays of unequal length. Repairing the
+# arguments here keeps the conversation flowing -- an error return makes the
+# model apologise out loud mid-presentation, which is worse than a rounded value.
+
+_SCALE_WORDS = {
+    "الف": 1e3, "ألف": 1e3, "آلاف": 1e3, "الاف": 1e3, "k": 1e3,
+    "مليون": 1e6, "ملايين": 1e6, "m": 1e6, "mn": 1e6,
+    "مليار": 1e9, "مليارات": 1e9, "b": 1e9, "bn": 1e9,
+}
+
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def coerce_number(raw) -> Optional[float]:
+    """Best-effort number out of whatever the model sent. None if hopeless."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) if math.isfinite(float(raw)) else None
+
+    text = str(raw).translate(_ARABIC_DIGITS).strip()
+    if not text:
+        return None
+    text = text.replace(",", "").replace("٫", ".").replace("%", "")
+
+    scale = 1.0
+    for word, mult in _SCALE_WORDS.items():
+        # Suffix match only, so "مليون" in a label can't inflate a bare number.
+        if text.lower().endswith(word):
+            scale = mult
+            text = text[: -len(word)].strip()
+            break
+
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group()) * scale
+    except ValueError:
+        return None
+
+
+def normalize_tile(args: dict) -> tuple[Optional[dict], str]:
+    """Turn raw add_tile arguments into a valid tile.
+
+    Returns (tile, note). `tile` is None only when the request is unusable.
+    """
+    tile_type = str(args.get("type", "")).strip().lower()
+    # Common near-misses from the model.
+    tile_type = {
+        "stat_grid": "kpi", "stats": "kpi", "number": "kpi", "numbers": "kpi",
+        "doughnut": "pie", "donut": "pie", "column": "bar", "trend": "line",
+        "area": "line", "list": "table",
+    }.get(tile_type, tile_type)
+    if tile_type not in TILE_TYPES:
+        return None, f"type must be one of {', '.join(TILE_TYPES)}"
+
+    labels = args.get("labels") or []
+    if not isinstance(labels, list) or not labels:
+        return None, "labels must be a non-empty array"
+    labels = [str(x).strip() for x in labels if str(x).strip()]
+    if not labels:
+        return None, "labels must be a non-empty array"
+
+    notes = []
+    text_values = args.get("text_values")
+    if tile_type == "table" and isinstance(text_values, list) and text_values:
+        values_out, texts_out = [], [str(x) for x in text_values]
+        n = min(len(labels), len(texts_out))
+        if len(labels) != len(texts_out):
+            notes.append("labels and text_values had different lengths; extras ignored")
+        labels, texts_out = labels[:n], texts_out[:n]
+    else:
+        raw_values = args.get("values") or []
+        if not isinstance(raw_values, list):
+            raw_values = []
+        if len(raw_values) != len(labels):
+            notes.append(
+                f"labels ({len(labels)}) and values ({len(raw_values)}) had "
+                "different lengths; extras ignored"
+            )
+        parsed = [coerce_number(v) for v in raw_values]
+        # Drop positions we couldn't read at all, keeping labels aligned.
+        pairs = [(l, v) for l, v in zip(labels, parsed) if v is not None]
+        if not pairs:
+            return None, "values must be an array of numbers"
+        if len(pairs) != min(len(labels), len(raw_values)):
+            notes.append("some values were unreadable and were dropped")
+        labels = [p[0] for p in pairs]
+        values_out = [p[1] for p in pairs]
+        texts_out = None
+
+    limit = TILE_MAX_ITEMS[tile_type]
+    if len(labels) > limit:
+        notes.append(f"showing the first {limit} items ({tile_type} fits {limit})")
+        labels = labels[:limit]
+        values_out = values_out[:limit]
+        if texts_out is not None:
+            texts_out = texts_out[:limit]
+
+    tile = {
+        "id": f"t{int(time.time() * 1000)}",
+        "type": tile_type,
+        "title": str(args.get("title", "")).strip() or "بيانات",
+        "labels": labels,
+        "values": values_out,
+    }
+    if texts_out is not None:
+        # camelCase: this key goes straight onto the wire (see protocol.ts).
+        tile["textValues"] = texts_out
+    unit = str(args.get("unit", "")).strip()
+    if unit:
+        tile["unit"] = unit
+    return tile, "; ".join(notes)
 
 
 def set_full_volume() -> None:
@@ -404,45 +624,108 @@ class AppState:
         self.tracking_active = False
         self.gemini_connected = False
         self.gemini_speaking = False
-        # Presentation screen state (what /display on the laptop shows).
-        self.display_charts: list = []
+        # Presentation screen state. This is the source of truth; the deployed
+        # panel is a projection of it, replayed in full on every reconnect.
+        self.display_tiles: list = []
         self.display_title = ""
         self.display_video_url = ""
         self.display_video_title = ""
-        self.display_mode = ""  # "" | "chart" | "video"
+        self.display_mode = ""  # "" | "dashboard" | "video"
+        self.panel = None  # PanelClient, attached in main()
 
-    def add_chart(self, chart: dict):
+    # --- panel plumbing ---
+
+    def attach_panel(self, client) -> None:
+        self.panel = client
+
+    def _emit(self, event: dict) -> None:
+        """Push one event to the panel; never let the screen break the robot."""
+        panel = self.panel
+        if panel is None:
+            return
+        try:
+            panel.emit(event)
+        except Exception:
+            pass
+
+    def snapshot_events(self) -> list:
+        """Current state as a replayable event list (used on panel reconnect)."""
         with self.lock:
-            self.display_mode = "chart"
+            mode, title = self.display_mode, self.display_title
+            tiles = list(self.display_tiles)
+            url, vtitle = self.display_video_url, self.display_video_title
+            speaking = self.gemini_speaking
+        events = [{"type": "robot.status", "online": True, "speaking": speaking}]
+        if mode == "video" and url:
+            events.append({"type": "video.show", "url": url, "title": vtitle})
+        elif mode == "dashboard":
+            events.append({"type": "dashboard.begin", "title": title})
+            events += [{"type": "dashboard.tile", "tile": t} for t in tiles]
+        else:
+            events.append({"type": "display.clear"})
+        return events
+
+    # --- display mutations ---
+
+    def begin_dashboard(self, title: str) -> None:
+        with self.lock:
+            self.display_mode = "dashboard"
+            self.display_title = title
+            self.display_tiles = []
             self.display_video_url = ""
             self.display_video_title = ""
-            self.display_charts.append(chart)
+        self._emit({"type": "dashboard.begin", "title": title})
 
-    def clear_display(self):
+    def add_tile(self, tile: dict) -> int:
+        """Append one tile. Returns the tile count after the append."""
         with self.lock:
-            self.display_charts = []
+            if self.display_mode != "dashboard":
+                self.display_mode = "dashboard"
+                self.display_tiles = []
+                self.display_video_url = ""
+                self.display_video_title = ""
+            self.display_tiles.append(tile)
+            # Same ceiling the panel enforces, so both ends agree on what's shown.
+            if len(self.display_tiles) > MAX_TILES:
+                self.display_tiles = self.display_tiles[-MAX_TILES:]
+            count = len(self.display_tiles)
+        self._emit({"type": "dashboard.tile", "tile": tile})
+        return count
+
+    def clear_display(self) -> None:
+        with self.lock:
+            self.display_tiles = []
             self.display_title = ""
             self.display_video_url = ""
             self.display_video_title = ""
             self.display_mode = ""
+        self._emit({"type": "display.clear"})
 
-    def set_video(self, url: str, title: str = ""):
+    def set_video(self, url: str, title: str = "") -> None:
         with self.lock:
             self.display_mode = "video"
             self.display_video_url = url
             self.display_video_title = title
-            self.display_charts = []
+            self.display_tiles = []
+        self._emit({"type": "video.show", "url": url, "title": title})
+
+    def set_speaking(self, speaking: bool) -> None:
+        """Called every vision frame; only forwards actual transitions."""
+        if speaking == self.gemini_speaking:
+            return
+        self.gemini_speaking = speaking
+        self._emit({"type": "robot.status", "online": True, "speaking": speaking})
 
     def get_display(self) -> dict:
+        """State for the local fallback page on :8080 (no internet needed)."""
         with self.lock:
             if self.display_mode == "video":
                 return {"type": "video", "url": self.display_video_url,
                         "title": self.display_video_title}
-            elif self.display_mode == "chart":
-                return {"type": "chart", "title": self.display_title,
-                        "charts": self.display_charts}
-            else:
-                return {"type": "", "url": "", "title": "", "charts": []}
+            if self.display_mode == "dashboard":
+                return {"type": "dashboard", "title": self.display_title,
+                        "tiles": self.display_tiles}
+            return {"type": "", "url": "", "title": "", "tiles": []}
 
     def set_frame(self, jpeg: bytes, **kwargs):
         with self.lock:
@@ -460,264 +743,89 @@ state = AppState()
 
 # --- HTTP MJPEG server ------------------------------------------------------
 
-# Presentation screen page: open http://<robot>:8080/display on the laptop.
-# It polls /api/display and shows whatever the robot (Gemini tools) selects.
+# Local fallback screen: http://<robot>:8080/display
+#
+# The real presentation screen is the deployed panel (see panel/). This page
+# exists only for demos with no internet: deliberately dependency-free -- no
+# CDN fonts, no chart library -- because those are exactly what fail offline.
 DISPLAY_HTML = r"""<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>شاشة العرض</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<title>شاشة العرض (محلي)</title>
 <style>
-:root{
-  --bg:#0a0e1a;--bg2:#111827;--card:#151c2e;--card-h:#1a2338;
-  --border:#1e293b;--text:#e6edf3;--dim:#8b98a9;--accent:#5ea3f7;
-  --green:#22c55e;--red:#ef4444;--blue:#3b82f6;--purple:#a78bfa;
-  --orange:#f59e0b;--cyan:#06b6d4;--pink:#ec4899;--teal:#14b8a6;
-}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);overflow:hidden}
-body{font-family:'Tajawal',system-ui,sans-serif;color:var(--text)}
-#dot{position:fixed;top:16px;left:16px;z-index:100;width:10px;height:10px;
-border-radius:50%;background:var(--red);opacity:.85;transition:background .3s}
-#idle{min-height:100vh;display:flex;flex-direction:column;align-items:center;
-justify-content:center;text-align:center;padding:0 8vw;transition:opacity .4s}
-#idle h1{font-size:48px;font-weight:900;margin:0 0 12px;
-background:linear-gradient(135deg,#5ea3f7,#a78bfa);-webkit-background-clip:text;
--webkit-text-fill-color:transparent;background-clip:text}
-#idle .sub{font-size:23px;color:var(--dim);margin:8px 0;line-height:1.8;max-width:780px}
-#idle .comp{font-size:28px;font-weight:700;color:var(--accent);margin:24px 0 8px;letter-spacing:.5px}
-#idle .hint{font-size:19px;color:#5a6678;margin-top:28px}
-#idle .pulse{width:80px;height:80px;border-radius:50%;border:3px solid var(--accent);
-margin:0 0 30px;animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{transform:scale(1);opacity:.4}50%{transform:scale(1.1);opacity:.8}}
-#dash{display:none;height:100vh;flex-direction:column}
-#dash-header{padding:18px 28px;background:linear-gradient(180deg,rgba(21,28,46,.95),rgba(10,14,26,.9));
-border-bottom:1px solid var(--border);backdrop-filter:blur(12px);flex-shrink:0}
-#dash-title{font-size:30px;font-weight:800;margin:0;color:var(--text);text-align:center}
-#dash-grid{flex:1;overflow-y:auto;padding:20px;display:grid;
-grid-template-columns:repeat(2,1fr);gap:16px;align-content:stretch;
-grid-auto-rows:1fr}
-@media(min-width:1400px){#dash-grid{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:700px){#dash-grid{grid-template-columns:1fr}}
-.tile{background:var(--card);border:1px solid var(--border);border-radius:16px;
-padding:18px 20px;display:flex;flex-direction:column;animation:tileIn .4s ease-out;
-transition:border-color .3s,transform .2s}
-.tile:hover{border-color:var(--accent);transform:translateY(-2px)}
-@keyframes tileIn{from{opacity:0;transform:translateY(20px) scale(.96)}to{opacity:1;transform:none}}
-.tile-title{font-size:18px;font-weight:700;margin:0 0 14px;color:var(--accent);
-padding-bottom:10px;border-bottom:1px solid var(--border)}
-.tile-body{flex:1;position:relative;min-height:0}
-.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;flex:1;align-content:center}
-@media(max-width:500px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
-.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
-padding:18px 12px;text-align:center;transition:transform .2s,border-color .2s;
-display:flex;flex-direction:column;justify-content:center}
-.stat-card:hover{transform:scale(1.05);border-color:var(--accent)}
-.stat-value{font-size:32px;font-weight:900;line-height:1.1;margin-bottom:6px;
-background:linear-gradient(135deg,#5ea3f7,#a78bfa);-webkit-background-clip:text;
--webkit-text-fill-color:transparent;background-clip:text}
-.stat-label{font-size:14px;color:var(--dim);font-weight:500}
-.tile canvas{max-height:none;flex:1}
-#video-frame{display:none;width:100%;height:100vh;border:0;background:#000}
-.hidden{display:none!important}
+body{margin:0;height:100vh;background:#0a0e1a;color:#e6edf3;overflow:hidden;
+font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+#wrap{height:100vh;display:flex;flex-direction:column}
+h1{font-size:28px;font-weight:800;margin:0;padding:18px;text-align:center;
+border-bottom:1px solid #1e293b;color:#5ea3f7}
+#grid{flex:1;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+gap:14px;padding:16px;overflow:auto;align-content:start}
+.tile{background:#151c2e;border:1px solid #1e293b;border-radius:14px;padding:16px}
+.tile h2{font-size:17px;margin:0 0 12px;color:#5ea3f7;font-weight:700}
+.row{display:flex;justify-content:space-between;gap:10px;padding:6px 0;
+border-bottom:1px solid #16202f;font-size:16px}
+.row b{font-variant-numeric:tabular-nums;color:#a78bfa}
+#idle{flex:1;display:flex;flex-direction:column;align-items:center;
+justify-content:center;text-align:center;padding:0 8vw}
+#idle p{color:#8b98a9;font-size:20px;line-height:1.8}
+iframe{width:100%;height:100vh;border:0;background:#000;display:none}
 </style></head>
 <body>
-<div id="dot"></div>
-<div id="idle">
-  <div class="pulse"></div>
-  <h1>أهلًا! أنا روبوتكم الذكي</h1>
-  <p class="sub">اسألوني عن منظومة تطوير التعليم وشركاتها،
-  وأقدر أعرض لكم الإحصائيات والرسوم البيانية والفيديوهات على هذه الشاشة.</p>
-  <p class="comp">تيتكو &nbsp;•&nbsp; التعليمية &nbsp;•&nbsp; تطوير للمباني &nbsp;•&nbsp; رافد</p>
-  <p class="hint">جرّبوا تقولون لي: «اعرض لي أرقام رافد» أو «قارن بين الشركات»</p>
+<div id="wrap">
+  <h1 id="title">شاشة العرض</h1>
+  <div id="grid"></div>
+  <div id="idle"><p>في انتظار المحتوى…</p></div>
 </div>
-<div id="dash">
-  <div id="dash-header"><h2 id="dash-title">لوحة العرض</h2></div>
-  <div id="dash-grid"></div>
-</div>
-<iframe id="video-frame"
-allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"
-allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
+<iframe id="video" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>
 <script>
-let lastSerial = null;
-const idle = document.getElementById("idle");
-const dash = document.getElementById("dash");
-const dashGrid = document.getElementById("dash-grid");
-const dashTitle = document.getElementById("dash-title");
-const videoFrame = document.getElementById("video-frame");
-const dot = document.getElementById("dot");
-const COLORS = ["#5ea3f7","#a78bfa","#22c55e","#f59e0b","#ec4899","#06b6d4","#14b8a6","#ef4444"];
+const $ = (id) => document.getElementById(id);
+let last = null;
+
 function fmt(n){
-  if(n>=1e9) return (n/1e9).toFixed(1).replace(/\.0$/,"")+"B";
-  if(n>=1e6) return (n/1e6).toFixed(1).replace(/\.0$/,"")+"M";
-  if(n>=1e3) return (n/1e3).toFixed(1).replace(/\.0$/,"")+"K";
+  const a = Math.abs(n);
+  if(a >= 1e9) return (n/1e9).toFixed(1).replace(/\.0$/,"") + " مليار";
+  if(a >= 1e6) return (n/1e6).toFixed(1).replace(/\.0$/,"") + " مليون";
+  if(a >= 1e3) return (n/1e3).toFixed(1).replace(/\.0$/,"") + " ألف";
   return String(Math.round(n));
 }
-function toEmbed(url){
+
+function embed(url){
   try{
     const u = new URL(url);
-    let id = null;
-    if(u.hostname.includes("youtu.be")) id = u.pathname.slice(1);
-    else if(u.searchParams.get("v")) id = u.searchParams.get("v");
-    else { const m = u.pathname.match(/\/(embed|shorts)\/([\w-]{11})/); if(m) id = m[2]; }
-    if(!id) return url;
-    const t = parseInt(u.searchParams.get("t")) || 0;
-    let src = "https://www.youtube-nocookie.com/embed/" + id + "?autoplay=1&rel=0&enablejsapi=1";
-    if(t) src += "&start=" + t;
-    return src;
+    const id = u.hostname.includes("youtu.be") ? u.pathname.slice(1)
+             : u.searchParams.get("v");
+    return id ? "https://www.youtube-nocookie.com/embed/" + id + "?autoplay=1&rel=0" : url;
   }catch(e){ return url; }
 }
-function forcePlay(){
-  try{ videoFrame.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}',"*"); }catch(e){}
+
+function render(d){
+  const isVideo = d.type === "video" && d.url;
+  $("video").style.display = isVideo ? "block" : "none";
+  $("wrap").style.display = isVideo ? "none" : "flex";
+  if(isVideo){ $("video").src = embed(d.url); return; }
+  $("video").src = "about:blank";
+
+  const tiles = d.tiles || [];
+  $("title").textContent = d.title || "شاشة العرض";
+  $("idle").style.display = tiles.length ? "none" : "flex";
+  $("grid").innerHTML = tiles.map(t => {
+    const rows = t.labels.map((label, i) => {
+      const v = t.textValues ? t.textValues[i]
+              : fmt(t.values[i] || 0) + (t.unit ? " " + t.unit : "");
+      return `<div class="row"><span>${label}</span><b>${v}</b></div>`;
+    }).join("");
+    return `<div class="tile"><h2>${t.title || ""}</h2>${rows}</div>`;
+  }).join("");
 }
-function showVideo(url, title){
-  videoFrame.src = toEmbed(url);
-  videoFrame.style.display = "block";
-  idle.classList.add("hidden");
-  dash.classList.add("hidden");
-  dash.style.display = "none";
-  videoFrame.classList.remove("hidden");
-  document.title = title || "شاشة العرض";
-  setTimeout(forcePlay, 1500);
-  setTimeout(forcePlay, 3500);
-}
-function hideVideo(){
-  videoFrame.src = "about:blank";
-  videoFrame.style.display = "none";
-  videoFrame.classList.add("hidden");
-}
-function animateValue(el, target){
-  const dur = 1000, start = performance.now();
-  function tick(now){
-    const p = Math.min((now-start)/dur, 1);
-    const eased = 1 - Math.pow(1-p, 3);
-    el.textContent = fmt(target * eased);
-    if(p < 1) requestAnimationFrame(tick);
-    else el.textContent = fmt(target);
-  }
-  requestAnimationFrame(tick);
-}
-function renderStatGrid(container, chart){
-  const grid = document.createElement("div");
-  grid.className = "stat-grid";
-  chart.labels.forEach((label, i) => {
-    const val = chart.values[i] || 0;
-    const card = document.createElement("div");
-    card.className = "stat-card";
-    const vEl = document.createElement("div");
-    vEl.className = "stat-value";
-    const lEl = document.createElement("div");
-    lEl.className = "stat-label";
-    lEl.textContent = label;
-    card.appendChild(vEl);
-    card.appendChild(lEl);
-    grid.appendChild(card);
-    animateValue(vEl, val);
-  });
-  container.appendChild(grid);
-}
-function renderBarChart(container, chart){
-  const canvas = document.createElement("canvas");
-  container.appendChild(canvas);
-  new Chart(canvas, {
-    type: "bar",
-    data: {
-      labels: chart.labels,
-      datasets: [{
-        data: chart.values,
-        backgroundColor: chart.labels.map((_,i) => COLORS[i % COLORS.length] + "cc"),
-        borderColor: chart.labels.map((_,i) => COLORS[i % COLORS.length]),
-        borderWidth: 2, borderRadius: 8, minBarLength: 8,
-      }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false },
-        tooltip: { callbacks: { label: ctx => fmt(ctx.parsed.y) } } },
-      scales: {
-        x: { ticks: { color: "#8b98a9", font: { family: "Tajawal", size: 13 } },
-             grid: { display: false } },
-        y: { ticks: { color: "#8b98a9", callback: v => fmt(v) },
-             grid: { color: "#1e293b" } }
-      }
-    }
-  });
-}
-function renderPieChart(container, chart){
-  const canvas = document.createElement("canvas");
-  container.appendChild(canvas);
-  new Chart(canvas, {
-    type: "doughnut",
-    data: {
-      labels: chart.labels,
-      datasets: [{
-        data: chart.values,
-        backgroundColor: chart.labels.map((_,i) => COLORS[i % COLORS.length]),
-        borderColor: "#0a0e1a", borderWidth: 3,
-      }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { position: "bottom",
-        labels: { color: "#e6edf3", font: { family: "Tajawal", size: 13 }, padding: 12 } } }
-    }
-  });
-}
-function renderDashboard(data){
-  hideVideo();
-  dashTitle.textContent = data.title || "لوحة العرض";
-  dashGrid.innerHTML = "";
-  const charts = data.charts || [];
-  charts.forEach((chart, idx) => {
-    const tile = document.createElement("div");
-    tile.className = "tile";
-    tile.style.animationDelay = (idx * 0.1) + "s";
-    const tEl = document.createElement("h3");
-    tEl.className = "tile-title";
-    tEl.textContent = chart.title || "";
-    tile.appendChild(tEl);
-    const body = document.createElement("div");
-    body.className = "tile-body";
-    tile.appendChild(body);
-    dashGrid.appendChild(tile);
-    if(chart.chart_type === "stat_grid") renderStatGrid(body, chart);
-    else if(chart.chart_type === "bar") renderBarChart(body, chart);
-    else if(chart.chart_type === "pie") renderPieChart(body, chart);
-  });
-  idle.classList.add("hidden");
-  dash.style.display = "flex";
-  dash.classList.remove("hidden");
-  document.title = data.title || "شاشة العرض";
-}
-function showIdle(){
-  hideVideo();
-  dash.classList.add("hidden");
-  dash.style.display = "none";
-  idle.classList.remove("hidden");
-  document.title = "شاشة العرض";
-}
+
 async function poll(){
   try{
-    const r = await fetch("/api/display", {cache: "no-store"});
+    const r = await fetch("/api/display", {cache:"no-store"});
     const d = await r.json();
-    dot.style.background = "#22c55e";
-    const serial = JSON.stringify(d);
-    if(serial !== lastSerial){
-      lastSerial = serial;
-      if(d.type === "video" && d.url){
-        showVideo(d.url, d.title);
-      } else if(d.type === "chart" && d.charts && d.charts.length > 0){
-        renderDashboard(d);
-      } else {
-        showIdle();
-      }
-    }
-  }catch(e){
-    dot.style.background = "#ef4444";
-  }
+    const s = JSON.stringify(d);
+    if(s !== last){ last = s; render(d); }
+  }catch(e){}
   setTimeout(poll, 800);
 }
 poll();
@@ -827,35 +935,81 @@ class LatestFrame:
         return buf.tobytes() if ok else None
 
 
-# --- Look-at marker (shared) ------------------------------------------------
-
-_LOOK_AT_LOCK = threading.Lock()
-_LOOK_AT_MARKER: dict = {}
-
-
-def _set_look_at_marker(nx, ny, description, bbox_norm=None):
-    with _LOOK_AT_LOCK:
-        _LOOK_AT_MARKER["nx"] = float(nx)
-        _LOOK_AT_MARKER["ny"] = float(ny)
-        _LOOK_AT_MARKER["description"] = description
-        _LOOK_AT_MARKER["bbox_norm"] = bbox_norm
-        _LOOK_AT_MARKER["timestamp"] = time.monotonic()
-
-
-def _get_look_at_marker(max_age_s=5.0):
-    with _LOOK_AT_LOCK:
-        ts = _LOOK_AT_MARKER.get("timestamp", 0)
-        if time.monotonic() - ts > max_age_s:
-            return None
-        return dict(_LOOK_AT_MARKER)
-
-
 # --- Tool builders (same interface as main.py) ------------------------------
 
-def build_test_tools() -> list:
+# Curated conversational subset of the emotions library. The full library
+# ships 85 clips (dances, death throes, sleep...) which would just be noise
+# in a tool schema, so we advertise the ones that map to a conversational
+# beat. Intersected with what the library actually contains at runtime.
+EMOTION_CHOICES: dict[str, str] = {
+    "welcoming1": "greeting someone / saying hello",
+    "cheerful1": "happy, upbeat",
+    "enthusiastic1": "excited, eager",
+    "curious1": "curious about something",
+    "inquiring1": "asking a question",
+    "attentive1": "listening closely",
+    "surprised1": "mild surprise",
+    "amazed1": "strong amazement / wow",
+    "proud1": "proud of an achievement",
+    "grateful1": "thanking someone",
+    "laughing1": "laughing at something funny",
+    "thoughtful1": "thinking / considering",
+    "confused1": "confused, did not understand",
+    "uncertain1": "unsure, hesitant",
+    "understanding1": "acknowledging, 'I see'",
+    "sad1": "sad, disappointed",
+    "oops1": "made a mistake / apologising",
+    "relief1": "relieved",
+    "success1": "celebrating success",
+    "yes1": "emphatic yes / agreement",
+    "no1": "emphatic no / disagreement",
+    "shy1": "shy, bashful",
+    "calming1": "reassuring, calming someone down",
+    "tired1": "tired, sleepy",
+    "dance1": "dancing when asked to dance",
+}
+
+
+def build_test_tools(emotion_names: Optional[list] = None) -> list:
+    """Build the general tool set.
+
+    Args:
+        emotion_names: Names actually present in the loaded emotions library.
+            ``play_emotion`` is only advertised if this is non-empty, so the
+            model can never call a clip we cannot play.
+    """
+    available = [n for n in EMOTION_CHOICES if n in set(emotion_names or [])]
+
+    emotion_tools = []
+    if available:
+        emotion_tools.append(
+            genai_types.FunctionDeclaration(
+                name="play_emotion",
+                description=(
+                    "Play a short pre-recorded emotional body-language clip "
+                    "(head, body and antennas move together, with sound). "
+                    "Use for a genuine emotional beat, a few times per "
+                    "conversation at most -- not as punctuation on every "
+                    "reply. Interrupts any clip already playing. Options: "
+                    + "; ".join(f"{n} = {EMOTION_CHOICES[n]}" for n in available)
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "name": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            enum=available,
+                            description="Which emotion clip to play.",
+                        ),
+                    },
+                    required=["name"],
+                ),
+            )
+        )
+
     return [
         genai_types.Tool(
-            function_declarations=[
+            function_declarations=emotion_tools + [
                 genai_types.FunctionDeclaration(
                     name="get_current_time",
                     description="Return the current local time and date.",
@@ -931,24 +1085,6 @@ def build_test_tools() -> list:
                     parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
                 ),
                 genai_types.FunctionDeclaration(
-                    name="look_at",
-                    description=(
-                        "Look at a specific object in the camera view. "
-                        "Describe the object and the robot will use "
-                        "computer vision to locate it and move its head."
-                    ),
-                    parameters=genai_types.Schema(
-                        type=genai_types.Type.OBJECT,
-                        properties={
-                            "description": genai_types.Schema(
-                                type=genai_types.Type.STRING,
-                                description="Description of the object to look at.",
-                            ),
-                        },
-                        required=["description"],
-                    ),
-                ),
-                genai_types.FunctionDeclaration(
                     name="show_content",
                     description=(
                         "Show a company video on the presentation screen. "
@@ -972,40 +1108,80 @@ def build_test_tools() -> list:
                     ),
                 ),
                 genai_types.FunctionDeclaration(
-                    name="show_chart",
+                    name="add_tile",
                     description=(
-                        "Add a chart tile to the dashboard grid on the "
-                        "presentation screen. Call multiple times to build "
-                        "a multi-chart dashboard. Each call adds one tile. "
-                        "Use stat_grid for company key numbers (big animated "
-                        "numbers in a grid), bar for comparing companies on "
-                        "one metric, pie for showing a breakdown. Labels "
-                        "and values must be the same length."
+                        "Add ONE tile to the dashboard on the presentation "
+                        "screen. Call it 3-4 times in a row to build a full "
+                        "dashboard -- one tile alone looks empty. Every tile "
+                        "type uses the same two parallel arrays: labels[] and "
+                        "values[] (or text_values[] for a table). "
+                        "Example, 'show me Rafed's numbers': "
+                        "add_tile(title='أرقام رافد', type='kpi', "
+                        "labels=['طلاب','حافلات','رحلات يومية'], "
+                        "values=[740000,20000,40000]) then "
+                        "add_tile(title='مقارنة عدد الطلاب', type='bar', "
+                        "labels=['رافد','تطوير للمباني'], "
+                        "values=[740000,764000], unit='طالب') then "
+                        "add_tile(title='نمو الأسطول', type='line', "
+                        "labels=['2022','2023','2024'], "
+                        "values=[12000,16000,20000])."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
                         properties={
                             "title": genai_types.Schema(
                                 type=genai_types.Type.STRING,
-                                description="Chart heading in Arabic, e.g. 'أرقام رافد'.",
+                                description="Tile heading in Arabic, e.g. 'أرقام رافد'.",
                             ),
-                            "chart_type": genai_types.Schema(
+                            "type": genai_types.Schema(
                                 type=genai_types.Type.STRING,
-                                enum=["stat_grid", "bar", "pie"],
-                                description="stat_grid = big numbers in a grid, bar = comparison chart, pie = breakdown donut",
+                                enum=list(TILE_TYPES),
+                                description=(
+                                    "kpi = big numbers (2-6 headline figures). "
+                                    "bar = compare entities on one metric. "
+                                    "pie = breakdown of a whole. "
+                                    "line = trend over time (labels are years). "
+                                    "table = non-numeric facts, needs text_values."
+                                ),
                             ),
                             "labels": genai_types.Schema(
                                 type=genai_types.Type.ARRAY,
                                 items=genai_types.Schema(type=genai_types.Type.STRING),
-                                description="Labels for each item, same length as values.",
+                                description="Name of each item, in Arabic.",
                             ),
                             "values": genai_types.Schema(
                                 type=genai_types.Type.ARRAY,
                                 items=genai_types.Schema(type=genai_types.Type.NUMBER),
-                                description="Numeric values, same length as labels.",
+                                description=(
+                                    "Plain numbers, one per label, same order. "
+                                    "No separators or words: 740000, not '740 ألف'."
+                                ),
+                            ),
+                            "text_values": genai_types.Schema(
+                                type=genai_types.Type.ARRAY,
+                                items=genai_types.Schema(type=genai_types.Type.STRING),
+                                description=(
+                                    "Only for type='table': short Arabic text per "
+                                    "label instead of numbers."
+                                ),
+                            ),
+                            "unit": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "Optional unit shown after the numbers, e.g. "
+                                    "'طالب', 'مدرسة', '%', 'ريال'."
+                                ),
+                            ),
+                            "dashboard_title": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "Only on the FIRST tile of a new dashboard: "
+                                    "the overall heading, e.g. 'نظرة عامة على رافد'. "
+                                    "Starting a new dashboard replaces the old tiles."
+                                ),
                             ),
                         },
-                        required=["title", "chart_type", "labels", "values"],
+                        required=["title", "type", "labels"],
                     ),
                 ),
                 genai_types.FunctionDeclaration(
@@ -1116,62 +1292,6 @@ def build_face_tools() -> list:
     ]
 
 
-# --- Look-at object detection (OpenRouter Qwen3-VL) -------------------------
-
-def _look_at_object(api_key, jpeg_bytes, description, frame_w, frame_h) -> dict:
-    try:
-        from openai import OpenAI
-        or_key = os.getenv("OPENROUTER_API_KEY", api_key)
-        if not or_key:
-            return {"found": False, "error": "OPENROUTER_API_KEY not set"}
-        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=or_key)
-        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-        data_url = f"data:image/jpeg;base64,{b64}"
-        prompt = (
-            f"Locate the {description} in the image. "
-            f'Return ONLY JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "{description}"}} '
-            f"using absolute pixel coordinates in an image that is "
-            f"{frame_w} pixels wide and {frame_h} pixels tall. "
-            f'If not visible, return {{"bbox_2d": null}}.'
-        )
-        response = client.chat.completions.create(
-            model=LOOK_AT_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-            max_tokens=128,
-            temperature=0.0,
-        )
-        text = response.choices[0].message.content or ""
-        match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
-        if not match:
-            return {"found": False, "error": "no JSON in response"}
-        data = json.loads(match.group(0))
-        bbox = data.get("bbox_2d") or data.get("bbox") or data.get("box")
-        if not bbox or len(bbox) != 4:
-            return {"found": False, "error": "object not visible"}
-        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
-        if max(x1, y1, x2, y2) <= 1000 and max(frame_w, frame_h) > 1000:
-            x1 = int(x1 * frame_w / 1000); x2 = int(x2 * frame_w / 1000)
-            y1 = int(y1 * frame_h / 1000); y2 = int(y2 * frame_h / 1000)
-        x1 = max(0, min(frame_w - 1, x1)); x2 = max(0, min(frame_w - 1, x2))
-        y1 = max(0, min(frame_h - 1, y1)); y2 = max(0, min(frame_h - 1, y2))
-        if x2 - x1 < 4 or y2 - y1 < 4:
-            return {"found": False, "error": "bbox too small"}
-        nx = (x1 + x2) / 2.0 / max(1, frame_w)
-        ny = (y1 + y2) / 2.0 / max(1, frame_h)
-        return {"found": True, "nx": nx, "ny": ny,
-                "bbox_norm": [x1/max(1,frame_w), y1/max(1,frame_h),
-                              x2/max(1,frame_w), y2/max(1,frame_h)],
-                "confidence": "high", "label": data.get("label", description)}
-    except Exception as e:
-        return {"found": False, "error": str(e)}
-
-
 # --- Tool handler -----------------------------------------------------------
 
 def make_tool_handler(
@@ -1180,10 +1300,8 @@ def make_tool_handler(
     recognizer: cv2.FaceRecognizerSF,
     face_db: SimpleFaceDB,
     latest: LatestFrame,
-    api_key: str,
-    frame_w: int,
-    frame_h: int,
     mouth_state: dict,
+    emotion_player: Optional["EmotionPlayer"] = None,
 ):
     """Build the async tool handler for Gemini Live."""
 
@@ -1264,35 +1382,38 @@ def make_tool_handler(
                         "available_titles": [e.get("title") for e in url_catalog]}
             if entry.get("type") != "video":
                 return {"ok": False, "reason": "not_video",
-                        "note": "Only videos are supported. Use show_chart for company data."}
+                        "note": "Only videos are supported. Use add_tile for company data."}
             state.set_video(entry.get("url", ""), entry.get("title", ""))
             return {"ok": True, "title": entry.get("title"),
                     "type": "video",
                     "note": "Now playing on the presentation screen."}
 
-        if name == "show_chart":
-            title = str(args.get("title", "")).strip() or "رسم بياني"
-            chart_type = str(args.get("chart_type", "stat_grid")).strip()
-            labels = args.get("labels", [])
-            values = args.get("values", [])
-            if not isinstance(labels, list) or not isinstance(values, list):
-                return {"ok": False, "error": "labels and values must be arrays"}
-            if len(labels) != len(values):
-                return {"ok": False, "error": "labels and values must be the same length"}
-            if len(labels) == 0:
-                return {"ok": False, "error": "labels and values cannot be empty"}
-            if chart_type not in ("stat_grid", "bar", "pie"):
-                return {"ok": False, "error": f"Unknown chart_type: {chart_type}"}
-            chart = {
-                "title": title,
-                "chart_type": chart_type,
-                "labels": [str(l) for l in labels],
-                "values": [float(v) for v in values],
-            }
-            state.add_chart(chart)
-            return {"ok": True, "title": title, "chart_type": chart_type,
-                    "items": len(labels),
-                    "note": "Chart added to the dashboard."}
+        if name == "add_tile":
+            tile, note = normalize_tile(args)
+            if tile is None:
+                return {"ok": False, "error": note}
+
+            # A dashboard_title (or a screen that isn't already a dashboard)
+            # means this is tile #1 of a new dashboard.
+            dash_title = str(args.get("dashboard_title", "")).strip()
+            if dash_title or state.display_mode != "dashboard":
+                state.begin_dashboard(dash_title or tile["title"])
+
+            count = state.add_tile(tile)
+            result = {"ok": True, "title": tile["title"], "type": tile["type"],
+                      "tiles_now": count}
+            if note:
+                result["adjusted"] = note
+            # Nudging beats prompt rules: the model reliably keeps going until
+            # the dashboard is full rather than stopping after one tile.
+            if count < 3:
+                result["note"] = (
+                    f"{count} tile(s) so far -- add {3 - count} more with "
+                    "another add_tile call, then speak."
+                )
+            else:
+                result["note"] = "Dashboard looks complete. Speak now."
+            return result
 
         if name == "clear_display":
             state.clear_display()
@@ -1429,38 +1550,29 @@ def make_tool_handler(
                     "head_tracking": state.tracking_active,
                     "gemini_connected": state.gemini_connected}
 
-        # --- Look at object (OpenRouter Qwen3-VL) ---
-        if name == "look_at":
-            description = str(args.get("description", "")).strip()
-            if not description:
-                return {"ok": False, "error": "description is required"}
-            jpeg = latest.get_mirrored_jpeg()
-            if jpeg is None:
-                return {"ok": False, "error": "no camera frame"}
+        # --- Body language ---
+        if name == "play_emotion":
+            if emotion_player is None:
+                return {"ok": False, "error": "emotions library not loaded"}
+            emotion = str(args.get("name", "")).strip()
+            if not emotion:
+                return {"ok": False, "error": "name is required"}
 
-            async def _look_at_task():
+            # Fire-and-forget: the clip runs for a second or more and the
+            # model should keep talking over it, not block on it. Only hand
+            # the head back to tracking if it was tracking to begin with.
+            resume = not _manual_mode["active"]
+
+            async def _emotion_task():
                 try:
-                    result = await asyncio.to_thread(
-                        _look_at_object, api_key, jpeg, description, frame_w, frame_h)
-                    if not result.get("found"):
-                        log.info("look_at: not found: %s", result.get("error"))
-                        return
-                    nx, ny = result["nx"], result["ny"]
-                    _set_look_at_marker(nx, ny, description,
-                                        bbox_norm=result.get("bbox_norm"))
-                    yaw_deg = (nx - 0.5) * 120.0
-                    pitch_deg = (ny - 0.5) * 60.0
-                    yaw_deg = max(-60, min(60, yaw_deg))
-                    pitch_deg = max(-30, min(30, pitch_deg))
-                    _head_to(yaw_deg, pitch_deg)
-                    # Auto-resume face follow after 3s
-                    await asyncio.sleep(3.0)
-                    _resume_face_follow()
+                    await emotion_player.play(
+                        emotion, TRACK_WEIGHT, resume_tracking=resume,
+                    )
                 except Exception:
-                    log.exception("look_at task failed")
+                    log.exception("play_emotion task failed")
 
-            asyncio.create_task(_look_at_task())
-            return {"ok": True, "status": "searching", "description": description}
+            asyncio.create_task(_emotion_task())
+            return {"ok": True, "emotion": emotion, "status": "playing"}
 
         return {"ok": False, "error": f"unknown tool: {name}"}
 
@@ -1471,7 +1583,7 @@ def make_tool_handler(
 
 def draw_overlay(frame, faces, scale, speaker_id, labels, energies):
     """Draw detection boxes + HUD on the frame."""
-    h, w = frame.shape[:2]
+    h = frame.shape[0]
     n = faces.shape[0] if faces is not None else 0
 
     for i in range(n):
@@ -1497,17 +1609,6 @@ def draw_overlay(frame, faces, scale, speaker_id, labels, energies):
             f"Voice:{gemini_status}")
     cv2.putText(frame, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, (0, 255, 0), 2, cv2.LINE_AA)
-
-    # Look-at marker
-    lam = _get_look_at_marker(max_age_s=5.0)
-    if lam:
-        lx = int(lam.get("nx", 0.5) * w); ly = int(lam.get("ny", 0.5) * h)
-        cv2.line(frame, (lx - 15, ly), (lx + 15, ly), (255, 0, 255), 2)
-        cv2.line(frame, (lx, ly - 15), (lx, ly + 15), (255, 0, 255), 2)
-        cv2.circle(frame, (lx, ly), 6, (255, 0, 255), 2)
-        cv2.putText(frame, f"LOOK: {lam.get('description', '?')}",
-                    (lx + 10, ly - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 0, 255), 1, cv2.LINE_AA)
 
     cv2.putText(frame, "Ctrl-C to quit", (10, h - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
@@ -1631,6 +1732,10 @@ def main() -> None:
                         help="Disable face enrollment/identification")
     parser.add_argument("--track-weight", type=float, default=TRACK_WEIGHT,
                         help="Daemon head tracking weight (0-1)")
+    parser.add_argument("--no-wobble", action="store_true",
+                        help="Disable audio-reactive head wobbling")
+    parser.add_argument("--no-emotions", action="store_true",
+                        help="Disable the play_emotion tool (emotions library)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -1699,6 +1804,27 @@ def main() -> None:
         print("  WARNING: No audio - Gemini voice disabled")
         args.no_gemini = True
 
+    # --- Audio-reactive head wobble (SDK) ---
+    # Analyses everything pushed to the speaker and composes 6-DOF head
+    # offsets daemon-side *before* IK, so it layers on top of head tracking
+    # instead of fighting it. This replaces any hand-rolled talking animation.
+    if gemini_audio_ok and not args.no_wobble:
+        try:
+            mini.enable_wobbling()
+            print("  head wobbling ON (audio-reactive)")
+        except Exception as exc:
+            print(f"  WARNING: enable_wobbling failed: {exc}")
+
+    # --- Emotions library (SDK recorded moves) ---
+    emotion_player: Optional[EmotionPlayer] = None
+    if not args.no_emotions:
+        emotion_player = EmotionPlayer(mini)
+        if emotion_player.load():
+            print(f"  emotions library loaded ({len(emotion_player.names)} clips)")
+        else:
+            print("  WARNING: emotions library unavailable - play_emotion disabled")
+            emotion_player = None
+
     # --- Shared state ---
     latest = LatestFrame()
     mouth_state: dict = {"energies": [], "labels": [], "speaker_id": -1}
@@ -1727,12 +1853,14 @@ def main() -> None:
             all_tools = []
             if not args.no_face_recognition:
                 all_tools.extend(build_face_tools())
-            all_tools.extend(build_test_tools())
+            all_tools.extend(build_test_tools(
+                emotion_names=emotion_player.names if emotion_player else None,
+            ))
             if all_tools:
                 kwargs["tools"] = all_tools
                 kwargs["tool_handler"] = make_tool_handler(
                     mini, detector, recognizer, face_db, latest,
-                    api_key, 1280, 720, mouth_state,
+                    mouth_state, emotion_player,
                 )
             model = args.model or os.environ.get("GEMINI_MODEL")
             if model:
@@ -1745,6 +1873,21 @@ def main() -> None:
             except Exception as exc:
                 print(f"  WARNING: Gemini Live failed: {exc}")
                 gemini = None
+
+    # --- Presentation panel ---
+    global PANEL_URL, PANEL_TOKEN
+    PANEL_URL = os.environ.get("PANEL_URL", "")
+    PANEL_TOKEN = os.environ.get("HSAFA_PANEL_TOKEN", "")
+    panel = None
+    if PANEL_URL:
+        panel = PanelClient(
+            PANEL_URL, PANEL_TOKEN, snapshot=state.snapshot_events
+        )
+        state.attach_panel(panel)
+        panel.start()
+        print(f"  Panel: {PANEL_URL}")
+    else:
+        print(f"  Panel: not configured (local screen only, :{HTTP_PORT}/display)")
 
     # --- HTTP server ---
     http_thread = threading.Thread(target=start_http_server, daemon=True)
@@ -1761,27 +1904,30 @@ def main() -> None:
         stop["flag"] = True
     signal.signal(signal.SIGINT, _sigint)
 
-    # --- Antenna animator ---
-    animator = AntennaAnimator()
-    anim_last_t = time.time()
+    # --- Antenna idle breathe ---
+    breather = AntennaBreather()
 
     # --- Main loop ---
     try:
         while not stop["flag"]:
             if gemini is not None:
-                state.gemini_speaking = gemini.is_speaking.is_set()
+                state.set_speaking(gemini.is_speaking.is_set())
             try:
                 vision_loop_step(mini, detector, recognizer, face_db, latest, mouth_state)
 
-                # Antenna animation (doesn't conflict with daemon head tracking)
-                now_t = time.time()
-                dt = now_t - anim_last_t
-                anim_last_t = now_t
-                r_ant, l_ant = animator.tick(is_talking=state.gemini_speaking, dt=dt)
-                try:
-                    mini.set_target(antennas=[r_ant, l_ant])
-                except Exception:
-                    pass
+                # Antenna breathe. Muted while an emotion clip is playing --
+                # recorded moves drive the antennas themselves, and two
+                # writers would fight over them.
+                playing = (
+                    emotion_player is not None
+                    and emotion_player.is_playing.is_set()
+                )
+                if not playing:
+                    r_ant, l_ant = breather.tick()
+                    try:
+                        mini.set_target(antennas=[r_ant, l_ant])
+                    except Exception:
+                        pass
             except Exception as e:
                 if not stop["flag"]:
                     log.debug("vision_loop_step error: %s", e)
@@ -1798,9 +1944,24 @@ def main() -> None:
         except Exception:
             pass
 
+        # Cancel any in-flight emotion clip and zero the wobbler offsets --
+        # leftover offsets would be composed into the goto_sleep pose.
+        if emotion_player is not None and emotion_player.is_playing.is_set():
+            try:
+                mini.cancel_move()
+            except Exception:
+                pass
+        try:
+            mini.disable_wobbling()
+        except Exception:
+            pass
+
         if gemini is not None:
             print("Stopping Gemini...")
             gemini.stop()
+
+        if panel is not None:
+            panel.stop()
 
         print("Going to sleep...")
         try:

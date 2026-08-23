@@ -1,0 +1,11 @@
+# Local-only overlay: publishes the port so you can reach the production image
+# from your browser. Kept in a separate file (rather than the auto-loaded
+# docker-compose.override.yml) so Coolify can never pick it up and expose port
+# 3000 on the VPS.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+#
+services:
+  panel:
+    ports:
+      - "3100:3000"

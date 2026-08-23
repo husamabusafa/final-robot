@@ -1,1 +1,22 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node / panel
+node_modules/
+panel/dist/
+
+# Models + face data (downloaded / generated at runtime)
+models/
+data/faces/
+
+# OS
+.DS_Store
