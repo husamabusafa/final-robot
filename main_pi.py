@@ -674,8 +674,13 @@ def normalize_tile(args: dict) -> tuple[Optional[dict], str]:
     return tile, "; ".join(notes)
 
 
-def set_full_volume() -> None:
-    """Push every playback mixer control to 100% (voice was too low at 62%)."""
+def set_full_volume(level: int = 100) -> None:
+    """Push every playback mixer control to the given level (default 100%).
+
+    ``--quiet`` / ``--volume`` pass a lower level so the robot can be tested
+    in quiet places without disturbing anyone.
+    """
+    level = max(0, min(100, int(level)))
     try:
         out = subprocess.run(
             ["amixer", "scontrols"], capture_output=True, text=True, timeout=5
@@ -687,10 +692,10 @@ def set_full_volume() -> None:
         ] or ["Master"]
         for n in targets:
             subprocess.run(
-                ["amixer", "sset", n, "100%", "unmute"],
+                ["amixer", "sset", n, f"{level}%", "unmute"],
                 capture_output=True, timeout=5,
             )
-        print(f"  Speaker volume -> 100% ({', '.join(targets)})")
+        print(f"  Speaker volume -> {level}% ({', '.join(targets)})")
     except Exception as e:
         print(f"  WARNING: could not set volume: {e}")
 
@@ -2006,6 +2011,10 @@ def main() -> None:
                         help="Disable audio-reactive head wobbling")
     parser.add_argument("--no-emotions", action="store_true",
                         help="Disable the play_emotion tool (emotions library)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Low volume for testing in quiet places (15%)")
+    parser.add_argument("--volume", type=int, default=100,
+                        help="Speaker volume 0-100 (default: 100; --quiet = 15)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -2069,7 +2078,7 @@ def main() -> None:
         media.start_playing()
         print(f"  Audio ready: in={media.get_input_audio_samplerate()}Hz "
               f"out={media.get_output_audio_samplerate()}Hz")
-        set_full_volume()
+        set_full_volume(15 if args.quiet else args.volume)
     elif not args.no_gemini:
         print("  WARNING: No audio - Gemini voice disabled")
         args.no_gemini = True
