@@ -310,6 +310,18 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- Offer to show a chart or video when it would genuinely help -- "
     "not in every reply. Call the tool only after the user agrees.\n"
     "\n"
+    "COMPANY QUESTIONS\n"
+    "- Answer from the company knowledge base below -- it is the "
+    "source of truth. Never invent facts or numbers that aren't in "
+    "it.\n"
+    "- Start with a short spoken summary (2-3 sentences max), then "
+    "ask if the person wants more detail. Give the full details only "
+    "after they say yes -- and put numbers or footage on the screen "
+    "instead of reciting them.\n"
+    "- A specific question gets a specific answer first, with one or "
+    "two sentences of useful surrounding context when relevant.\n"
+    "- Don't pad with unrelated information, guesses, or repetition.\n"
+    "\n"
     "TOOLS\n"
     "- Use a tool whenever it provides information or actions you "
     "cannot reliably do yourself. Casual chat needs no tools -- "
@@ -609,7 +621,9 @@ def build_system_instruction() -> str:
             + "\n"
         )
     remote_kb = fetch_remote_knowledge()
-    if remote_kb:
+    # Skip the remote copy when it duplicates the local file (same document
+    # kept in both places would be appended to the prompt twice).
+    if remote_kb and remote_kb != kb and remote_kb not in kb:
         instruction += (
             "\nLATEST UPDATES FROM THE OPERATIONS TEAM\n"
             "These facts were updated most recently. When they conflict "
