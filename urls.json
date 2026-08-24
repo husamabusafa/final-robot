@@ -70,5 +70,14 @@
     "url": "https://www.youtube.com/watch?v=adqmbS5ROCM&t=1s",
     "verified": false,
     "keywords": ["رافد", "rafed", "فيديو", "سلامة", "قواعد", "نقل مدرسي"]
+  },
+  {
+    "id": "rafed_planning_dashboard",
+    "company": "رافد",
+    "title": "لوحة الطلاب المسجلين في خدمة النقل",
+    "type": "page",
+    "url": "https://planning-dashboard-staging.rafed.cloud/",
+    "verified": true,
+    "keywords": ["رافد", "rafed", "لوحة", "dashboard", "تخطيط", "planning", "الطلاب", "مسجلين", "نقل", "إدارات", "إحصائيات", "بيانات"]
   }
 ]

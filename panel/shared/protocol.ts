@@ -42,13 +42,14 @@ export interface Tile {
   markers?: MapMarker[];
 }
 
-export type DisplayMode = "idle" | "dashboard" | "video";
+export type DisplayMode = "idle" | "dashboard" | "video" | "page";
 
 export interface DisplayState {
   mode: DisplayMode;
   title: string;
   tiles: Tile[];
   video: { url: string; title: string } | null;
+  page: { url: string; title: string } | null;
   robot: { online: boolean; speaking: boolean };
 }
 
@@ -57,6 +58,7 @@ export const initialState: DisplayState = {
   title: "",
   tiles: [],
   video: null,
+  page: null,
   robot: { online: false, speaking: false },
 };
 
@@ -65,6 +67,7 @@ export type DisplayEvent =
   | { type: "dashboard.begin"; title: string }
   | { type: "dashboard.tile"; tile: Tile }
   | { type: "video.show"; url: string; title: string }
+  | { type: "page.show"; url: string; title: string }
   | { type: "display.clear" }
   | { type: "robot.status"; online: boolean; speaking: boolean };
 
@@ -83,7 +86,7 @@ export type ClientMessage = { v: number } & DisplayEvent;
 export function applyEvent(state: DisplayState, ev: DisplayEvent): DisplayState {
   switch (ev.type) {
     case "dashboard.begin":
-      return { ...state, mode: "dashboard", title: ev.title, tiles: [], video: null };
+      return { ...state, mode: "dashboard", title: ev.title, tiles: [], video: null, page: null };
 
     case "dashboard.tile": {
       // A tile can arrive without a preceding begin (Gemini calling add_tile
@@ -93,15 +96,19 @@ export function applyEvent(state: DisplayState, ev: DisplayEvent): DisplayState 
         ...state,
         mode: "dashboard",
         video: null,
+        page: null,
         tiles: tiles.slice(-MAX_TILES),
       };
     }
 
     case "video.show":
-      return { ...state, mode: "video", video: { url: ev.url, title: ev.title }, tiles: [] };
+      return { ...state, mode: "video", video: { url: ev.url, title: ev.title }, tiles: [], page: null };
+
+    case "page.show":
+      return { ...state, mode: "page", page: { url: ev.url, title: ev.title }, tiles: [], video: null };
 
     case "display.clear":
-      return { ...state, mode: "idle", title: "", tiles: [], video: null };
+      return { ...state, mode: "idle", title: "", tiles: [], video: null, page: null };
 
     case "robot.status":
       return { ...state, robot: { online: ev.online, speaking: ev.speaking } };
@@ -125,6 +132,9 @@ export function parseEvent(raw: unknown): DisplayEvent | null {
     case "video.show":
       if (!o.url) return null;
       return { type: "video.show", url: String(o.url), title: String(o.title ?? "") };
+    case "page.show":
+      if (!o.url) return null;
+      return { type: "page.show", url: String(o.url), title: String(o.title ?? "") };
     case "display.clear":
       return { type: "display.clear" };
     case "robot.status":

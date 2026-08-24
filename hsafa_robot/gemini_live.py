@@ -300,6 +300,21 @@ class GeminiLiveSession:
         except Exception as e:
             log.warning("inject scheduling failed: %s", e)
 
+    def request_interruption(self) -> None:
+        """Force the robot to stop talking and listen.
+
+        Opens the barge-in hold window so the mic loop sends the next
+        ``_barge_in_hold_s`` seconds of audio to Gemini's server-side VAD,
+        which fires ``interrupted`` and halts playback. Used by the
+        antenna-touch watcher: a physical pull is a deterministic
+        "stop talking" signal that doesn't depend on audio levels
+        (which are unreliable while the speaker is bleeding into the mic).
+        """
+        now = time.monotonic()
+        self._barge_in_until = now + self._barge_in_hold_s
+        self._barge_in_run = self._barge_in_min_chunks
+        log.info("Interruption requested (barge-in window opened)")
+
     # ---- thread entry ---------------------------------------------------
     def _thread_main(self) -> None:
         try:

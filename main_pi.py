@@ -94,6 +94,98 @@ class AntennaBreather:
         return (base + wiggle, base - wiggle)
 
 
+# --- Antenna pull-to-interrupt ------------------------------------------------
+
+class AntennaTouchWatcher:
+    """Detect a physical antenna pull while speaking -> stop talking.
+
+    Mirrors Pollen's daemon-side ``AntennaTouchDetector`` (v1.9.0, PR #1244):
+    hysteresis on present-vs-commanded deviation, fires once per pull.
+    Only active while Gemini is speaking -- it's a "stop talking" gesture,
+    not a general-purpose button.
+
+    The antennas are torque-ON and the breather holds them, so a visitor
+    must pull firmly (~14 degrees) against the servo. The threshold may
+    need tuning on the real robot; these are Pollen's hardware-validated
+    defaults as a starting point.
+    """
+
+    PRESS_DELTA_RAD = 0.25    # ~14 deg: fire threshold
+    RELEASE_DELTA_RAD = 0.10  # ~6 deg: re-arm only after antennas return
+    POLL_INTERVAL_S = 0.10    # 10 Hz
+    PRESS_MIN_SAMPLES = 2     # consecutive over-threshold samples to fire
+    SETTLE_S = 0.5            # suppress detection after an emotion clip ends
+
+    def __init__(self):
+        self._armed = False
+        self._press_run = 0
+        self._last_poll = 0.0
+        self._last_emotion_end = 0.0
+
+    def reset(self):
+        self._armed = False
+        self._press_run = 0
+
+    def tick(
+        self,
+        mini,
+        commanded: tuple,
+        gemini_speaking: bool,
+        emotion_playing: bool,
+    ) -> bool:
+        """Call every main-loop iteration. Returns True once on a pull.
+
+        ``commanded`` is the antenna target just sent to ``set_target``
+        (from the breather), so the deviation is purely physical push
+        against the servo -- breather motion is already subtracted out.
+        """
+        now = time.monotonic()
+        if now - self._last_poll < self.POLL_INTERVAL_S:
+            return False
+        self._last_poll = now
+
+        # Only meaningful while the robot is talking.
+        if not gemini_speaking:
+            self.reset()
+            return False
+
+        # Emotion clips own the antennas; suppress during and for a short
+        # settle window after one ends (post-clip position settling would
+        # otherwise read as a touch).
+        if emotion_playing:
+            self._last_emotion_end = now
+            self.reset()
+            return False
+        if now - self._last_emotion_end < self.SETTLE_S:
+            return False
+
+        try:
+            present = mini.get_present_antenna_joint_positions()
+        except Exception:
+            return False
+        if present is None or len(present) != 2:
+            return False
+        present = (float(present[0]), float(present[1]))
+
+        # Deviation of present from commanded = physical push against servo.
+        delta = max(abs(p - c) for p, c in zip(present, commanded))
+
+        if not self._armed:
+            if delta <= self.RELEASE_DELTA_RAD:
+                self._armed = True
+            return False
+
+        if delta >= self.PRESS_DELTA_RAD:
+            self._press_run += 1
+            if self._press_run >= self.PRESS_MIN_SAMPLES:
+                self._armed = False
+                self._press_run = 0
+                return True
+        else:
+            self._press_run = 0
+        return False
+
+
 # --- Emotions (SDK recorded-move library) ------------------------------------
 
 class EmotionPlayer:
@@ -748,7 +840,9 @@ class AppState:
         self.display_title = ""
         self.display_video_url = ""
         self.display_video_title = ""
-        self.display_mode = ""  # "" | "dashboard" | "video"
+        self.display_page_url = ""
+        self.display_page_title = ""
+        self.display_mode = ""  # "" | "dashboard" | "video" | "page"
         self.panel = None  # PanelClient, attached in main()
 
     # --- panel plumbing ---
@@ -772,10 +866,13 @@ class AppState:
             mode, title = self.display_mode, self.display_title
             tiles = list(self.display_tiles)
             url, vtitle = self.display_video_url, self.display_video_title
+            purl, ptitle = self.display_page_url, self.display_page_title
             speaking = self.gemini_speaking
         events = [{"type": "robot.status", "online": True, "speaking": speaking}]
         if mode == "video" and url:
             events.append({"type": "video.show", "url": url, "title": vtitle})
+        elif mode == "page" and purl:
+            events.append({"type": "page.show", "url": purl, "title": ptitle})
         elif mode == "dashboard":
             events.append({"type": "dashboard.begin", "title": title})
             events += [{"type": "dashboard.tile", "tile": t} for t in tiles]
@@ -792,6 +889,8 @@ class AppState:
             self.display_tiles = []
             self.display_video_url = ""
             self.display_video_title = ""
+            self.display_page_url = ""
+            self.display_page_title = ""
         self._emit({"type": "dashboard.begin", "title": title})
 
     def add_tile(self, tile: dict) -> int:
@@ -802,6 +901,8 @@ class AppState:
                 self.display_tiles = []
                 self.display_video_url = ""
                 self.display_video_title = ""
+                self.display_page_url = ""
+                self.display_page_title = ""
             self.display_tiles.append(tile)
             # Same ceiling the panel enforces, so both ends agree on what's shown.
             if len(self.display_tiles) > MAX_TILES:
@@ -816,6 +917,8 @@ class AppState:
             self.display_title = ""
             self.display_video_url = ""
             self.display_video_title = ""
+            self.display_page_url = ""
+            self.display_page_title = ""
             self.display_mode = ""
         self._emit({"type": "display.clear"})
 
@@ -824,8 +927,21 @@ class AppState:
             self.display_mode = "video"
             self.display_video_url = url
             self.display_video_title = title
+            self.display_page_url = ""
+            self.display_page_title = ""
             self.display_tiles = []
         self._emit({"type": "video.show", "url": url, "title": title})
+
+    def set_page(self, url: str, title: str = "") -> None:
+        """Full-screen web page in an iframe (e.g. the planning dashboard)."""
+        with self.lock:
+            self.display_mode = "page"
+            self.display_page_url = url
+            self.display_page_title = title
+            self.display_video_url = ""
+            self.display_video_title = ""
+            self.display_tiles = []
+        self._emit({"type": "page.show", "url": url, "title": title})
 
     def set_speaking(self, speaking: bool) -> None:
         """Called every vision frame; only forwards actual transitions."""
@@ -840,6 +956,9 @@ class AppState:
             if self.display_mode == "video":
                 return {"type": "video", "url": self.display_video_url,
                         "title": self.display_video_title}
+            if self.display_mode == "page":
+                return {"type": "page", "url": self.display_page_url,
+                        "title": self.display_page_title}
             if self.display_mode == "dashboard":
                 return {"type": "dashboard", "title": self.display_title,
                         "tiles": self.display_tiles}
@@ -918,10 +1037,10 @@ function embed(url){
 }
 
 function render(d){
-  const isVideo = d.type === "video" && d.url;
-  $("video").style.display = isVideo ? "block" : "none";
-  $("wrap").style.display = isVideo ? "none" : "flex";
-  if(isVideo){ $("video").src = embed(d.url); return; }
+  const isFrame = (d.type === "video" || d.type === "page") && d.url;
+  $("video").style.display = isFrame ? "block" : "none";
+  $("wrap").style.display = isFrame ? "none" : "flex";
+  if(isFrame){ $("video").src = d.type === "page" ? d.url : embed(d.url); return; }
   $("video").src = "about:blank";
 
   const tiles = d.tiles || [];
@@ -1526,9 +1645,15 @@ def make_tool_handler(
             if not entry:
                 return {"ok": False, "reason": "not_found",
                         "available_titles": [e.get("title") for e in url_catalog]}
-            if entry.get("type") != "video":
-                return {"ok": False, "reason": "not_video",
-                        "note": "Only videos are supported. Use add_tile for company data."}
+            entry_type = entry.get("type")
+            if entry_type == "page":
+                state.set_page(entry.get("url", ""), entry.get("title", ""))
+                return {"ok": True, "title": entry.get("title"),
+                        "type": "page",
+                        "note": "Now showing on the presentation screen."}
+            if entry_type != "video":
+                return {"ok": False, "reason": "unsupported_type",
+                        "note": "Only videos and pages are supported. Use add_tile for company data."}
             state.set_video(entry.get("url", ""), entry.get("title", ""))
             return {"ok": True, "title": entry.get("title"),
                     "type": "video",
@@ -2051,6 +2176,7 @@ def main() -> None:
 
     # --- Antenna idle breathe ---
     breather = AntennaBreather()
+    antenna_watcher = AntennaTouchWatcher()
 
     # --- Main loop ---
     try:
@@ -2073,6 +2199,19 @@ def main() -> None:
                         mini.set_target(antennas=[r_ant, l_ant])
                     except Exception:
                         pass
+
+                    # Antenna pull-to-interrupt: detect a physical pull
+                    # while Gemini is speaking and force it to stop.
+                    if gemini is not None:
+                        pulled = antenna_watcher.tick(
+                            mini,
+                            commanded=(r_ant, l_ant),
+                            gemini_speaking=gemini.is_speaking.is_set(),
+                            emotion_playing=False,
+                        )
+                        if pulled:
+                            log.info("Antenna pull detected -> interrupting")
+                            gemini.request_interruption()
             except Exception as e:
                 if not stop["flag"]:
                     log.debug("vision_loop_step error: %s", e)

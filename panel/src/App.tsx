@@ -3,6 +3,7 @@ import { Dashboard } from "./components/Dashboard.tsx";
 import { IdleScreen } from "./components/IdleScreen.tsx";
 import { StatusDot } from "./components/StatusDot.tsx";
 import { VideoScreen } from "./components/VideoScreen.tsx";
+import { WebScreen } from "./components/WebScreen.tsx";
 import { useDisplay } from "./useDisplay.ts";
 
 export default function App() {
@@ -17,6 +18,10 @@ export default function App() {
         {state.mode === "video" && state.video ? (
           <motion.div key="video" className="h-full">
             <VideoScreen url={state.video.url} title={state.video.title} />
+          </motion.div>
+        ) : state.mode === "page" && state.page ? (
+          <motion.div key="page" className="h-full">
+            <WebScreen url={state.page.url} title={state.page.title} />
           </motion.div>
         ) : state.mode === "dashboard" && state.tiles.length > 0 ? (
           <motion.div
