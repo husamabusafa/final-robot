@@ -19,6 +19,10 @@ COPY --from=build /app/dist ./dist
 COPY server ./server
 COPY shared ./shared
 
+# Knowledge written via /admin lives here; compose mounts a named volume on
+# it so edits survive redeploys. Must be writable by the node user.
+RUN mkdir -p /app/data && chown node:node /app/data
+
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

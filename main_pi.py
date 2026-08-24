@@ -44,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -336,6 +337,37 @@ def load_company_knowledge(path: Path = COMPANY_KB_PATH) -> str:
     return text
 
 
+def fetch_remote_knowledge(timeout: float = 5.0) -> str:
+    """Extra KB from the panel (edited live at /admin); '' on any failure.
+
+    Derived from PANEL_URL (wss://host/robot -> https://host/api/knowledge).
+    The local rafed_knowledge.md stays the source of truth and the fallback:
+    anything that goes wrong here -- panel down, no PANEL_URL, bad token --
+    just means the robot runs on the shipped file only.
+    """
+    panel_url = os.environ.get("PANEL_URL", "").strip()
+    if not panel_url:
+        return ""
+    try:
+        http_url = re.sub(r"^ws", "http", panel_url)
+        parts = urllib.parse.urlsplit(http_url)
+        url = urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, "/api/knowledge", "", "")
+        )
+        token = os.environ.get("HSAFA_PANEL_TOKEN", "")
+        if token:
+            url += "?token=" + urllib.parse.quote(token)
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = str(data.get("text", "")).strip()
+        if text:
+            print(f"  remote knowledge loaded from panel ({len(text)} chars)")
+        return text
+    except Exception as e:
+        print(f"  WARNING: remote knowledge not loaded ({e}); local file only")
+        return ""
+
+
 # --- URL catalog (presentation screen content) ----------------------------
 # urls.json: list of {id, company, title, type ("video"|"page"), url,
 # keywords}. Loaded once at startup; the show_content tool searches it.
@@ -574,6 +606,15 @@ def build_system_instruction() -> str:
             "Rafed. If a fact is not listed, say you don't have that "
             "information instead of guessing.\n\n"
             + kb
+            + "\n"
+        )
+    remote_kb = fetch_remote_knowledge()
+    if remote_kb:
+        instruction += (
+            "\nLATEST UPDATES FROM THE OPERATIONS TEAM\n"
+            "These facts were updated most recently. When they conflict "
+            "with the COMPANY KNOWLEDGE above, prefer these.\n\n"
+            + remote_kb
             + "\n"
         )
     catalog = load_url_catalog()

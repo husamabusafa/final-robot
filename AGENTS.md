@@ -15,6 +15,23 @@ deployed presentation screen.
 | `tatweer-rafed-tetco-tbc-talimia.md` | Old group-wide KB (TETCO/Talemia/TBC/Rafed) — kept for reference, **not loaded** |
 | `urls.json` | Video catalog searched by the `show_content` tool |
 
+## Live knowledge updates
+
+`rafed_knowledge.md` is the robot's base KB and its offline fallback. On top of
+it, the panel hosts an editable "extra knowledge" text so facts can be updated
+without touching the Pi:
+
+- Editor at `https://robot-pannel.hsafa.com/admin`, guarded by
+  `HSAFA_PANEL_TOKEN`.
+- Relay endpoints: `GET/PUT /api/knowledge` (token required). Stored in a flat
+  file (`KNOWLEDGE_PATH`, default `<cwd>/data/knowledge.md`; the compose
+  `panel-data` volume makes it survive redeploys).
+- The robot fetches it in `build_system_instruction()` via
+  `fetch_remote_knowledge()` (derives `https://.../api/knowledge` from
+  `PANEL_URL`, 5s timeout). On any failure it silently runs on the local file
+  only. Remote text is appended as a "latest updates" section that wins
+  conflicts; changes apply on robot restart.
+
 ## Running the robot
 
 ```bash

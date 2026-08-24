@@ -20,3 +20,6 @@ data/faces/
 
 # OS
 .DS_Store
+
+# Local knowledge edits from the dev relay (panel data volume in prod)
+panel/data/

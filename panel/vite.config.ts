@@ -16,6 +16,7 @@ export default defineConfig({
     proxy: {
       "/panel": { target: RELAY, ws: true },
       "/robot": { target: RELAY, ws: true },
+      "/api": { target: RELAY },
       "/healthz": { target: RELAY },
     },
   },

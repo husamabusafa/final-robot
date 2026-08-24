@@ -11,6 +11,7 @@
  */
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import fs from "node:fs/promises";
 import Fastify from "fastify";
 import fastifyWebsocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
@@ -32,6 +33,13 @@ const SERVE_STATIC = process.env.SERVE_STATIC !== "false";
 const HEARTBEAT_MS = 30_000;
 
 const DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+
+// Extra robot knowledge edited via /admin and fetched by the robot at startup,
+// so facts can be updated without redeploying the Pi. Persisted on disk;
+// KNOWLEDGE_PATH points at a Docker volume in production.
+const KNOWLEDGE_PATH =
+  process.env.KNOWLEDGE_PATH ?? path.join(process.cwd(), "data", "knowledge.md");
+const KNOWLEDGE_MAX_CHARS = 128_000;
 
 if (!TOKEN) {
   console.warn(
@@ -71,6 +79,51 @@ app.get("/healthz", async () => ({
   robot: state.robot.online,
   seq,
 }));
+
+// --- robot knowledge (edited on /admin, fetched by the robot) ---------------
+
+type AuthedRequest = {
+  query?: unknown;
+  headers: { authorization?: string };
+};
+
+function suppliedToken(req: AuthedRequest): string {
+  return (
+    (req.query as Record<string, string | undefined>)?.token ??
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ??
+    ""
+  );
+}
+
+app.get("/api/knowledge", async (req, reply) => {
+  if (TOKEN && suppliedToken(req) !== TOKEN) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  try {
+    const text = await fs.readFile(KNOWLEDGE_PATH, "utf8");
+    const stat = await fs.stat(KNOWLEDGE_PATH);
+    return { ok: true, text, updated_at: stat.mtime.toISOString() };
+  } catch {
+    return { ok: true, text: "", updated_at: null };
+  }
+});
+
+app.put("/api/knowledge", async (req, reply) => {
+  if (TOKEN && suppliedToken(req) !== TOKEN) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const text = (req.body as { text?: unknown } | null)?.text;
+  if (typeof text !== "string") {
+    return reply.code(400).send({ error: "expected { text: string }" });
+  }
+  if (text.length > KNOWLEDGE_MAX_CHARS) {
+    return reply.code(413).send({ error: "knowledge too large" });
+  }
+  await fs.mkdir(path.dirname(KNOWLEDGE_PATH), { recursive: true });
+  await fs.writeFile(KNOWLEDGE_PATH, text, "utf8");
+  app.log.info({ chars: text.length }, "knowledge updated");
+  return { ok: true, updated_at: new Date().toISOString() };
+});
 
 app.get("/panel", { websocket: true }, (socket) => {
   panels.add(socket);
